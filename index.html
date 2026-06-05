@@ -28,7 +28,7 @@
 const { useState, useEffect, useCallback } = React;
 
 const GAS_URL = "https://script.google.com/macros/s/AKfycbwb3hMTcB1HYK_blQwojA52MQ145Eew8U2XgjxCcvkRicROHOsJHUvrH5lZZIBpZYCs/exec";
-const VERSION = "v1.2";
+const VERSION = "v1.3";
 
 // ── API via JSONP ──
 function jsonp(params) {
@@ -215,13 +215,17 @@ function Dashboard({sheets}){
 
 // ══ PROJETS ══
 const EP={name:"",statut:"en cours",avancement:0,equipe:0,budget:"",depense:"",client:"",lieu:"",note:""};
-function Projets({sheet}){
+function Projets({sheet,notes}){
   const [open,setOpen]=useState(false);
   const [form,setForm]=useState(EP);
   const [editing,setEditing]=useState(null);
   const [saving,setSaving]=useState(false);
   const [err,setErr]=useState("");
+  const [notesProjet,setNotesProjet]=useState(null);
+  const [noteForm,setNoteForm]=useState({titre:"",contenu:""});
+  const [savingNote,setSavingNote]=useState(false);
   const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+
   async function save(){
     if(!form.name.trim()){setErr("Nom obligatoire.");return;}
     setSaving(true);setErr("");
@@ -229,41 +233,81 @@ function Projets({sheet}){
       if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}
     catch(e){setErr(e.message);}setSaving(false);
   }
+
+  async function saveNote(){
+    if(!noteForm.contenu.trim())return;
+    setSavingNote(true);
+    try{await notes.add({projet_id:notesProjet.id,date:TODAY,titre:noteForm.titre,contenu:noteForm.contenu});
+      setNoteForm({titre:"",contenu:""});}catch(e){}
+    setSavingNote(false);
+  }
+
   const sc=(s)=>({retard:{bg:"#FCEBEB",tx:"#A32D2D"},finition:{bg:"#E1F5EE",tx:"#0F6E56"},démarrage:{bg:"#E6F1FB",tx:"#185FA5"},terminé:{bg:"#EAF3DE",tx:"#3B6D11"}}[s]||{bg:"#FAEEDA",tx:"#854F0B"});
-  const panel=open&&<SidePanel title={editing?"Modifier projet":"Nouveau projet"} onClose={()=>setOpen(false)}>
-    <FG label="Nom *"><Inp value={form.name} onChange={e=>f("name",e.target.value)} placeholder="Ex: Façade ETFE Lyon"/></FG>
-    <FG label="Client"><Inp value={form.client||""} onChange={e=>f("client",e.target.value)} placeholder="Ex: Société ABC"/></FG>
-    <FG label="Lieu"><Inp value={form.lieu||""} onChange={e=>f("lieu",e.target.value)} placeholder="Ex: Lyon"/></FG>
-    <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{PROJ_STATUTS.map(s=><option key={s}>{s}</option>)}</Sel></FG>
-    <FG label="Avancement (%)"><Inp type="number" value={form.avancement} onChange={e=>f("avancement",e.target.value)}/></FG>
-    <FG label="Budget (€)"><Inp type="number" value={form.budget} onChange={e=>f("budget",e.target.value)}/></FG>
-    <FG label="Dépensé (€)"><Inp type="number" value={form.depense} onChange={e=>f("depense",e.target.value)}/></FG>
-    <FG label="Nb personnes"><Inp type="number" value={form.equipe} onChange={e=>f("equipe",e.target.value)}/></FG>
-    <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
-    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Créer"}/>
-  </SidePanel>;
+
+  let panel=null;
+  if(notesProjet){
+    const projNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(notesProjet.id)).sort((a,b)=>b.date.localeCompare(a.date));
+    panel=<SidePanel title={`📝 Notes — ${notesProjet.name}`} onClose={()=>setNotesProjet(null)}>
+      <FG label="Titre (optionnel)"><Inp value={noteForm.titre} onChange={e=>setNoteForm(x=>({...x,titre:e.target.value}))} placeholder="Ex: Point chantier"/></FG>
+      <FG label="Note *"><Inp value={noteForm.contenu} onChange={e=>setNoteForm(x=>({...x,contenu:e.target.value}))} rows={3} placeholder="Saisir une note..."/></FG>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+        <Btn primary onClick={saveNote}><span className={savingNote?"spin":""}>{savingNote?"⟳":"+"}</span> Ajouter</Btn>
+      </div>
+      {!projNotes.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucune note pour ce projet.</div>}
+      {projNotes.map(n=>(
+        <div key={n.id} style={{padding:"10px 12px",borderRadius:8,background:"var(--bg-secondary)",marginBottom:8,border:"1px solid var(--border)"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <div>{n.titre&&<div style={{fontSize:13,fontWeight:500}}>{n.titre}</div>}<div style={{fontSize:11,color:"var(--text-secondary)"}}>{fmt(n.date)}</div></div>
+            <button onClick={()=>notes.remove(n.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"var(--text-tertiary)",alignSelf:"flex-start"}}>🗑</button>
+          </div>
+          <div style={{fontSize:13,color:"var(--text-primary)",whiteSpace:"pre-wrap"}}>{n.contenu}</div>
+        </div>
+      ))}
+    </SidePanel>;
+  } else if(open){
+    panel=<SidePanel title={editing?"Modifier projet":"Nouveau projet"} onClose={()=>setOpen(false)}>
+      <FG label="Nom *"><Inp value={form.name} onChange={e=>f("name",e.target.value)} placeholder="Ex: Façade ETFE Lyon"/></FG>
+      <FG label="Client"><Inp value={form.client||""} onChange={e=>f("client",e.target.value)} placeholder="Ex: Société ABC"/></FG>
+      <FG label="Lieu"><Inp value={form.lieu||""} onChange={e=>f("lieu",e.target.value)} placeholder="Ex: Lyon"/></FG>
+      <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{PROJ_STATUTS.map(s=><option key={s}>{s}</option>)}</Sel></FG>
+      <FG label="Avancement (%)"><Inp type="number" value={form.avancement} onChange={e=>f("avancement",e.target.value)}/></FG>
+      <FG label="Budget (€)"><Inp type="number" value={form.budget} onChange={e=>f("budget",e.target.value)}/></FG>
+      <FG label="Dépensé (€)"><Inp type="number" value={form.depense} onChange={e=>f("depense",e.target.value)}/></FG>
+      <FG label="Nb personnes"><Inp type="number" value={form.equipe} onChange={e=>f("equipe",e.target.value)}/></FG>
+      <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+      <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Créer"}/>
+    </SidePanel>;
+  }
+
   return <WithPanel panel={panel}>
     <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
       <span style={{fontSize:15,fontWeight:500}}>Projets ({sheet.rows.length})</span>
-      <Btn primary onClick={()=>{setEditing(null);setForm(EP);setErr("");setOpen(true);}}>+ Nouveau projet</Btn>
+      <Btn primary onClick={()=>{setNotesProjet(null);setEditing(null);setForm(EP);setErr("");setOpen(true);}}>+ Nouveau projet</Btn>
     </div>
     {sheet.loading&&<div style={{fontSize:13,color:"var(--text-secondary)",padding:12}}>Chargement...</div>}
     {!sheet.rows.length&&!sheet.loading&&<Bd style={{textAlign:"center",padding:24,color:"var(--text-secondary)",fontSize:13}}>Aucun projet.</Bd>}
     <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
-      {sheet.rows.map(p=>{const c=sc(p.statut);const bp=p.budget>0?Math.round(p.depense/p.budget*100):0;return(
-        <Bd key={p.id}>
-          <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
-            <div><div style={{fontSize:14,fontWeight:500}}>{p.name}</div>{p.client&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>{p.client}</div>}{p.lieu&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>📍 {p.lieu}</div>}</div>
-            <div style={{display:"flex",gap:4}}>
-              <button onClick={()=>{setEditing(p.id);setForm({...p});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>✏️</button>
-              <button onClick={()=>{if(confirm("Supprimer ce projet ?"))sheet.remove(p.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>🗑</button>
+      {sheet.rows.map(p=>{
+        const c=sc(p.statut);const bp=p.budget>0?Math.round(p.depense/p.budget*100):0;
+        const nbNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(p.id)).length;
+        return(
+          <Bd key={p.id}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+              <div><div style={{fontSize:14,fontWeight:500}}>{p.name}</div>{p.client&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>{p.client}</div>}{p.lieu&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>📍 {p.lieu}</div>}</div>
+              <div style={{display:"flex",gap:4,alignItems:"flex-start"}}>
+                <button onClick={()=>{setOpen(false);setNotesProjet(p);}} style={{background:"none",border:"1px solid var(--border)",borderRadius:6,cursor:"pointer",fontSize:12,padding:"2px 7px",color:"var(--text-secondary)",display:"flex",alignItems:"center",gap:4}}>
+                  📝{nbNotes>0&&<span style={{background:"#1D9E75",color:"#fff",borderRadius:10,fontSize:10,padding:"0 5px"}}>{nbNotes}</span>}
+                </button>
+                <button onClick={()=>{setNotesProjet(null);setEditing(p.id);setForm({...p});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>✏️</button>
+                <button onClick={()=>{if(confirm("Supprimer ce projet ?"))sheet.remove(p.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>🗑</button>
+              </div>
             </div>
-          </div>
-          <Badge label={p.statut} bg={c.bg} color={c.tx}/>
-          <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>Avancement : {p.avancement}%</div><PBar val={p.avancement}/>
-          {p.budget>0&&<><div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>{Number(p.depense).toLocaleString("fr-FR")}€ / {Number(p.budget).toLocaleString("fr-FR")}€</div><PBar val={bp}/></>}
-        </Bd>
-      );})}
+            <Badge label={p.statut} bg={c.bg} color={c.tx}/>
+            <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>Avancement : {p.avancement}%</div><PBar val={p.avancement}/>
+            {p.budget>0&&<><div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>{Number(p.depense).toLocaleString("fr-FR")}€ / {Number(p.budget).toLocaleString("fr-FR")}€</div><PBar val={bp}/></>}
+          </Bd>
+        );
+      })}
     </div>
   </WithPanel>;
 }
@@ -650,8 +694,7 @@ function App(){
   const journal      = useSheet("journal");
   const fournisseurs = useSheet("fournisseurs");
   const stocks       = useSheet("stocks");
-  const orders       = useSheet("orders");
-  const notes        = useSheet("notes");
+  const notes       = useSheet("notes");
   const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders,notes};
 
   useEffect(()=>{
