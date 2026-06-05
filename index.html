@@ -28,7 +28,7 @@
 const { useState, useEffect, useCallback } = React;
 
 const GAS_URL = "https://script.google.com/macros/s/AKfycbwb3hMTcB1HYK_blQwojA52MQ145Eew8U2XgjxCcvkRicROHOsJHUvrH5lZZIBpZYCs/exec";
-const VERSION = "v1.1";
+const VERSION = "v1.2";
 
 // ── API via JSONP ──
 function jsonp(params) {
@@ -650,8 +650,8 @@ function App(){
   const journal      = useSheet("journal");
   const fournisseurs = useSheet("fournisseurs");
   const stocks       = useSheet("stocks");
-  const orders       = useSheet("orders");
-  const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders};
+  const notes       = useSheet("notes");
+  const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders,notes};
 
   useEffect(()=>{
     gasInit().then(()=>setInitializing(false)).catch(e=>{setInitErr(e.message);setInitializing(false);});
@@ -693,7 +693,7 @@ function App(){
       </div>
       <div style={{flex:1,padding:16,background:"var(--bg-tertiary)"}}>
         {panel==="dashboard"   &&<Dashboard sheets={sheets}/>}
-        {panel==="projets"     &&<Projets sheet={projects} fournisseurs={fournisseurs}/>}
+        {panel==="projets"     &&<Projets sheet={projects} notes={notes}/>}
         {panel==="taches"      &&<Taches sheet={tasks} projects={projects}/>}
         {panel==="calendrier"  &&<Calendrier sheet={events} projects={projects}/>}
         {panel==="equipes"     &&<Equipes sheet={team} journal={journal}/>}
