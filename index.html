@@ -650,7 +650,8 @@ function Commandes({sheet,stocks,fournisseurs}){
           </div>
           <div style={{fontSize:12,color:"var(--text-secondary)",marginBottom:6}}>{o.fourn} · {o.qty} {o.unit} · {fmt(o.date)}</div>
           <div style={{display:"flex",gap:16}}>
-            <Check checked={isBool(o.passee)} onChange={()=>toggle(o,"passee")} label="Passée" color="#378ADD"/>
+        orders       = useSheet("orders");
+  const notes Check checked={isBool(o.passee)} onChange={()=>toggle(o,"passee")} label="Passée" color="#378ADD"/>
             <Check checked={isBool(o.recue)} onChange={()=>toggle(o,"recue")} label="Reçue" color="#1D9E75"/>
             <Check checked={isBool(o.factureCompta)} onChange={()=>toggle(o,"factureCompta")} label="→ Compta" color="#7F77DD"/>
           </div>
