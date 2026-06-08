@@ -42,7 +42,7 @@
 const { useState, useEffect, useCallback } = React;
 
 const GAS_URL = "https://script.google.com/macros/s/AKfycbwb3hMTcB1HYK_blQwojA52MQ145Eew8U2XgjxCcvkRicROHOsJHUvrH5lZZIBpZYCs/exec";
-const VERSION = "v1.6";
+const VERSION = "v1.7";
 
 // ── API via JSONP ──
 function jsonp(params) {
@@ -89,14 +89,24 @@ function fmt(d){
 // Normalise une date en YYYY-MM-DD pour les comparaisons
 function toISO(d){
   if(!d)return"";
+  // Objet Date JS
+  if(d instanceof Date)return d.toISOString().split("T")[0];
+  // String ISO avec heure ex: "2026-06-08T00:00:00.000Z"
   if(typeof d==="string"&&/^\d{4}-\d{2}-\d{2}/.test(d))return d.split("T")[0];
+  // Format JJ/MM/AAAA
   if(typeof d==="string"&&/^\d{1,2}\/\d{1,2}\/\d{4}$/.test(d)){
     const[day,m,y]=d.split("/");
     return`${y}-${m.padStart(2,"0")}-${day.padStart(2,"0")}`;
   }
-  if(!isNaN(d)){
+  // Timestamp numérique Google Sheets serial date
+  if(!isNaN(d)&&Number(d)>1000){
     const x=new Date(Math.round((Number(d)-25569)*86400000));
     return x.toISOString().split("T")[0];
+  }
+  // String date courte ex: "2026-6-8"
+  if(typeof d==="string"&&/^\d{4}-\d{1,2}-\d{1,2}$/.test(d)){
+    const[y,m,day]=d.split("-");
+    return`${y}-${m.padStart(2,"0")}-${day.padStart(2,"0")}`;
   }
   return"";
 }
@@ -286,9 +296,6 @@ function statutBadge(s){
 function Dashboard({sheets}){
   const {projects,tasks,stocks,orders,events}=sheets;
   const pending=tasks.rows.filter(t=>!t.done&&t.done!=="TRUE");
-  const isDone=t=>t.done===true||t.done==="TRUE";
-  async function toggleTask(t){await tasks.update(t.id,{...t,done:!isDone(t)});}
-  const urgentTasks=[...pending].filter(t=>["critique","high"].includes(autoUrgence(t.due,t.done))).slice(0,5);
   const stockAlerts=stocks.rows.filter(s=>Number(s.qty)<Number(s.min));
   const retards=projects.rows.filter(p=>p.statut==="retard");
   const upcoming=[...events.rows].sort((a,b)=>toISO(a.date).localeCompare(toISO(b.date))).filter(e=>toISO(e.date)>=TODAY).slice(0,5);
@@ -325,18 +332,13 @@ function Dashboard({sheets}){
       <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
         <Bd>
           <SecTitle>Tâches urgentes</SecTitle>
-          {!urgentTasks.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune tâche urgente.</div>}
-          {urgentTasks.map(t=>{
-            const urg=autoUrgence(t.due,t.done);
-            const u=UC[urg]||UC.med;
-            return(
-              <div key={t.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"0.5px solid #EEEEEE"}}>
-                <Check checked={isDone(t)} onChange={()=>toggleTask(t)} color="#CC2222"/>
-                <div style={{flex:1}}><div style={{fontSize:13,color:"#1C1C1C",fontWeight:500,textDecoration:isDone(t)?"line-through":"none"}}>{t.text}</div><div style={{fontSize:11,color:"#7A7A7A"}}>{t.projet} · {fmt(t.due)}</div></div>
-                <Badge label={u.lbl} bg={u.bg} color={u.tx}/>
-              </div>
-            );
-          })}
+          {!pending.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune tâche urgente.</div>}
+          {pending.filter(t=>t.urgence==="high").slice(0,5).map(t=>(
+            <div key={t.id} style={{display:"flex",gap:8,padding:"8px 0",borderBottom:"0.5px solid #EEEEEE"}}>
+              <div style={{width:3,background:"#CC2222",borderRadius:2,flexShrink:0}}/>
+              <div style={{flex:1}}><div style={{fontSize:13,color:"#1C1C1C",fontWeight:500}}>{t.text}</div><div style={{fontSize:11,color:"#7A7A7A"}}>{t.projet} · {fmt(t.due)}</div></div>
+            </div>
+          ))}
         </Bd>
         <Bd>
           <SecTitle>Prochains événements</SecTitle>
@@ -376,7 +378,326 @@ function Dashboard({sheets}){
 
 // ══ PROJETS ══
 const EP={name:"",statut:"en cours",avancement:0,equipe:0,budget:"",depense:"",client:"",lieu:"",note:""};
-function Projets({sheet,notes,tasks,orders,stocks,events}){
+function Projets({sheet,notes,tasks,orders,stocks,events,prestMissions,atelierChantier}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EP);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const [detail,setDetail]=useState(null);
+  const [notesProjet,setNotesProjet]=useState(null);
+  const [noteForm,setNoteForm]=useState({titre:"",contenu:""});
+  const [savingNote,setSavingNote]=useState(false);
+  const [showHistorique,setShowHistorique]=useState(false);
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  const isBool=v=>v===true||v==="TRUE";
+
+  async function save(){
+    if(!form.name.trim()){setErr("Nom obligatoire.");return;}
+    setSaving(true);setErr("");
+    try{const item={...form,avancement:+form.avancement||0,equipe:+form.equipe||0,budget:+form.budget||0,depense:+form.depense||0};
+      if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}
+      setOpen(false);setEditing(null);}
+    catch(e){setErr(e.message);}setSaving(false);
+  }
+
+  async function saveNote(){
+    if(!noteForm.contenu.trim())return;
+    setSavingNote(true);
+    try{await notes.add({projet_id:notesProjet.id,date:TODAY,titre:noteForm.titre,contenu:noteForm.contenu});setNoteForm({titre:"",contenu:""});}
+    catch(e){}setSavingNote(false);
+  }
+
+  async function finaliser(p){
+    if(!confirm(`Finaliser et archiver le projet "${p.name}" ?`))return;
+    await sheet.update(p.id,{...p,statut:"terminé",avancement:100});
+    setDetail(null);
+  }
+
+  // Recalcule les dépenses d'un projet depuis commandes + prestations
+  async function recalcDepenses(p){
+    const cmdTotal=orders.rows.filter(o=>o.projet===p.name&&isBool(o.recue)).reduce((s,o)=>s+Number(o.qty||0)*Number(o.prix||0),0);
+    const prestTotal=(prestMissions?.rows||[]).filter(m=>m.projet===p.name&&m.statut==="terminé").reduce((s,m)=>s+Number(m.prix||0),0);
+    const newDepense=cmdTotal+prestTotal;
+    if(newDepense!==Number(p.depense)){
+      await sheet.update(p.id,{...p,depense:newDepense});
+    }
+  }
+
+  const STATUT_COLORS={
+    "en cours":  {bg:"#E8F4FF",tx:"#185FA5"},
+    "démarrage": {bg:"#F2F0ED",tx:"#3A3A3A"},
+    "finition":  {bg:"#E6F9EE",tx:"#1A6B3A"},
+    "retard":    {bg:"#FFF0F0",tx:"#CC2222"},
+    "terminé":   {bg:"#E6F9EE",tx:"#1A6B3A"},
+    "en pause":  {bg:"#FFF8EC",tx:"#CC8800"},
+  };
+
+  const actifs=sheet.rows.filter(p=>p.statut!=="terminé");
+  const historique=sheet.rows.filter(p=>p.statut==="terminé");
+
+  // ── Vue détail ──
+  if(detail!==null){
+    const p=sheet.rows.find(x=>Number(x.id)===Number(detail));
+    if(!p){setDetail(null);return null;}
+
+    const projTasks=(tasks?.rows||[]).filter(t=>t.projet===p.name);
+    const projOrders=(orders?.rows||[]).filter(o=>o.projet===p.name);
+    const projNotes=(notes?.rows||[]).filter(n=>Number(n.projet_id)===Number(p.id)).sort((a,b)=>toISO(b.date).localeCompare(toISO(a.date)));
+    const projEvents=(events?.rows||[]).filter(e=>e.projet===p.name).sort((a,b)=>toISO(a.date).localeCompare(toISO(b.date)));
+    const projMissionsAtelier=(atelierChantier?.rows||[]).filter(m=>m.projet===p.name&&m.type==="atelier");
+    const projMissionsChantier=(atelierChantier?.rows||[]).filter(m=>m.projet===p.name&&m.type==="chantier");
+    const projPrest=(prestMissions?.rows||[]).filter(m=>m.projet===p.name);
+
+    const sc=STATUT_COLORS[p.statut]||{bg:"#F2F0ED",tx:"#3A3A3A"};
+    const cmdTotal=projOrders.filter(o=>isBool(o.recue)).reduce((s,o)=>s+Number(o.qty||0)*Number(o.prix||0),0);
+    const prestTotal=projPrest.filter(m=>m.statut==="terminé").reduce((s,m)=>s+Number(m.prix||0),0);
+    const depenseReelle=cmdTotal+prestTotal;
+    const budgetPct=p.budget>0?Math.round(depenseReelle/p.budget*100):0;
+
+    return(
+      <div>
+        <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:16}}>
+          <button onClick={()=>{setDetail(null);setNotesProjet(null);}} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:12,padding:"4px 10px",color:"#3A3A3A",fontFamily:"'DM Sans',sans-serif"}}>← Retour</button>
+          <div style={{fontSize:16,fontWeight:700,color:"#1C1C1C",flex:1}}>{p.name}</div>
+          <Badge label={p.statut} bg={sc.bg} color={sc.tx}/>
+          {p.statut!=="terminé"&&<Btn onClick={()=>{recalcDepenses(p);}} small>↻ Recalc. dépenses</Btn>}
+          {p.statut!=="terminé"&&<Btn primary onClick={()=>finaliser(p)}>Finaliser</Btn>}
+        </div>
+
+        {/* Infos */}
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
+          {[{lbl:"Client",val:p.client||"—"},{lbl:"Lieu",val:p.lieu||"—"},{lbl:"Équipe",val:p.equipe?`${p.equipe} pers.`:"—"}].map((m,i)=>(
+            <Bd key={i} style={{padding:"10px 14px"}}>
+              <div style={{fontSize:11,color:"#7A7A7A",marginBottom:3}}>{m.lbl}</div>
+              <div style={{fontSize:13,fontWeight:500}}>{m.val}</div>
+            </Bd>
+          ))}
+        </div>
+
+        {/* Avancement + Budget */}
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:12}}>
+          <Bd>
+            <SecTitle>Avancement</SecTitle>
+            <div style={{fontSize:28,fontWeight:700,marginBottom:4}}>{p.avancement}%</div>
+            <PBar val={p.avancement}/>
+            {p.note&&<div style={{fontSize:12,color:"#7A7A7A",marginTop:8,fontStyle:"italic"}}>{p.note}</div>}
+          </Bd>
+          <Bd>
+            <SecTitle>Budget & dépenses</SecTitle>
+            {p.budget>0?<>
+              <div style={{fontSize:13,marginBottom:4}}>
+                <span style={{fontWeight:700,fontSize:18,color:"#CC2222"}}>{depenseReelle.toLocaleString("fr-FR")} €</span>
+                <span style={{color:"#7A7A7A"}}> / {Number(p.budget).toLocaleString("fr-FR")} €</span>
+              </div>
+              <PBar val={budgetPct}/>
+              <div style={{fontSize:12,color:budgetPct>90?"#CC2222":"#7A7A7A",marginTop:4}}>{budgetPct}% consommé</div>
+              <div style={{marginTop:8,fontSize:11,color:"#7A7A7A",display:"flex",gap:12"}}>
+                <span>Commandes : {cmdTotal.toLocaleString("fr-FR")} €</span>
+                <span> · Prestations : {prestTotal.toLocaleString("fr-FR")} €</span>
+              </div>
+            </>:<div style={{fontSize:13,color:"#7A7A7A"}}>Aucun budget défini.</div>}
+          </Bd>
+        </div>
+
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:10}}>
+          {/* Tâches */}
+          <Bd>
+            <SecTitle>Tâches ({projTasks.length})</SecTitle>
+            {!projTasks.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune.</div>}
+            {projTasks.slice(0,5).map(t=>{const urg=autoUrgence(t.due,t.done);const u=UC[urg]||UC.med;const done=t.done===true||t.done==="TRUE";return(
+              <div key={t.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"0.5px solid #EEEEEE",alignItems:"center"}}>
+                <div style={{width:8,height:8,borderRadius:"50%",background:done?"#2A7A2A":u.tx,flexShrink:0}}/>
+                <div style={{flex:1,fontSize:12,color:done?"#7A7A7A":"#1C1C1C",textDecoration:done?"line-through":"none"}}>{t.text}</div>
+                <Badge label={u.lbl} bg={u.bg} color={u.tx}/>
+              </div>
+            );})}
+          </Bd>
+
+          {/* Planning */}
+          <Bd>
+            <SecTitle>Planning ({projEvents.length})</SecTitle>
+            {!projEvents.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucun événement.</div>}
+            {projEvents.slice(0,5).map(ev=>(
+              <div key={ev.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"0.5px solid #EEEEEE",alignItems:"center"}}>
+                <div style={{width:3,background:EV_COLORS[ev.type]||"#7A7A7A",borderRadius:2,alignSelf:"stretch",flexShrink:0}}/>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:500}}>{ev.title}</div>
+                  <div style={{fontSize:11,color:"#7A7A7A"}}>{fmt(ev.date)}{ev.heure&&` · ${ev.heure}`}</div>
+                </div>
+                <Badge label={EV_LABELS[ev.type]||ev.type} bg="#F2F0ED" color="#3A3A3A"/>
+              </div>
+            ))}
+          </Bd>
+
+          {/* Commandes */}
+          <Bd>
+            <SecTitle>Commandes ({projOrders.length})</SecTitle>
+            {!projOrders.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune.</div>}
+            {projOrders.slice(0,5).map(o=>(
+              <div key={o.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"0.5px solid #EEEEEE",alignItems:"center"}}>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:12,fontWeight:500}}>{o.article}</div>
+                  <div style={{fontSize:11,color:"#7A7A7A"}}>{o.fourn} · {fmt(o.date)}</div>
+                </div>
+                <span style={{fontSize:12,fontWeight:500,color:isBool(o.recue)?"#2A7A2A":"#CC8800"}}>{(Number(o.qty||0)*Number(o.prix||0)).toLocaleString("fr-FR")} €</span>
+                <Badge label={isBool(o.recue)?"Reçue":"En cours"} bg={isBool(o.recue)?"#E6F9EE":"#F2F0ED"} color={isBool(o.recue)?"#1A6B3A":"#3A3A3A"}/>
+              </div>
+            ))}
+          </Bd>
+
+          {/* Missions atelier/chantier */}
+          <Bd>
+            <SecTitle>Missions ({projMissionsAtelier.length+projMissionsChantier.length})</SecTitle>
+            {!projMissionsAtelier.length&&!projMissionsChantier.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune mission.</div>}
+            {[...projMissionsAtelier,...projMissionsChantier].slice(0,5).map(m=>(
+              <div key={m.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"0.5px solid #EEEEEE",alignItems:"center"}}>
+                <Badge label={m.type} bg="#F2F0ED" color="#3A3A3A"/>
+                <div style={{flex:1,fontSize:12}}>{m.description}</div>
+                <Badge label={m.statut} bg={m.statut==="terminé"?"#E6F9EE":"#FFF0F0"} color={m.statut==="terminé"?"#1A6B3A":"#CC2222"}/>
+              </div>
+            ))}
+          </Bd>
+
+          {/* Prestations */}
+          <Bd>
+            <SecTitle>Prestations ({projPrest.length})</SecTitle>
+            {!projPrest.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune.</div>}
+            {projPrest.slice(0,4).map(m=>(
+              <div key={m.id} style={{display:"flex",gap:8,padding:"6px 0",borderBottom:"0.5px solid #EEEEEE",alignItems:"center"}}>
+                <div style={{flex:1,fontSize:12}}>{m.description}</div>
+                <span style={{fontSize:12,fontWeight:500,color:m.statut==="terminé"?"#2A7A2A":"#CC8800"}}>{Number(m.prix||0).toLocaleString("fr-FR")} €</span>
+                <Badge label={m.statut} bg={m.statut==="terminé"?"#E6F9EE":"#F2F0ED"} color={m.statut==="terminé"?"#1A6B3A":"#3A3A3A"}/>
+              </div>
+            ))}
+          </Bd>
+
+          {/* Notes */}
+          <Bd>
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+              <SecTitle>Notes ({projNotes.length})</SecTitle>
+              <Btn small onClick={()=>setNotesProjet(notesProjet?null:p)}>+ Note</Btn>
+            </div>
+            {notesProjet&&Number(notesProjet.id)===Number(p.id)&&(
+              <div style={{marginBottom:10,padding:"8px 10px",background:"#F2F0ED",borderRadius:6}}>
+                <FG label="Titre"><Inp value={noteForm.titre} onChange={e=>setNoteForm(x=>({...x,titre:e.target.value}))} placeholder="Optionnel"/></FG>
+                <FG label="Contenu *"><Inp value={noteForm.contenu} onChange={e=>setNoteForm(x=>({...x,contenu:e.target.value}))} rows={2} placeholder="Saisir une note..."/></FG>
+                <div style={{display:"flex",gap:6,justifyContent:"flex-end"}}>
+                  <Btn small onClick={()=>setNotesProjet(null)}>Annuler</Btn>
+                  <Btn small primary onClick={saveNote}>{savingNote?"⟳":"+"} Ajouter</Btn>
+                </div>
+              </div>
+            )}
+            {!projNotes.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune note.</div>}
+            {projNotes.slice(0,3).map(n=>(
+              <div key={n.id} style={{padding:"8px 10px",borderRadius:6,background:"#F9F9F9",marginBottom:6,border:"0.5px solid #EEEEEE"}}>
+                {n.titre&&<div style={{fontSize:12,fontWeight:700,marginBottom:2}}>{n.titre}</div>}
+                <div style={{fontSize:11,color:"#7A7A7A",fontFamily:"'DM Mono',monospace",marginBottom:3}}>{fmt(n.date)}</div>
+                <div style={{fontSize:12,color:"#3A3A3A",whiteSpace:"pre-wrap"}}>{n.contenu}</div>
+              </div>
+            ))}
+          </Bd>
+        </div>
+
+        <div style={{display:"flex",gap:8,marginTop:6}}>
+          <Btn onClick={()=>{setNotesProjet(null);setEditing(p.id);setForm({...p,budget:p.budget??"",depense:p.depense??""});setErr("");setOpen(true);}}>Modifier</Btn>
+          {p.statut!=="terminé"&&<Btn danger onClick={()=>finaliser(p)}>Finaliser et archiver</Btn>}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Vue liste ──
+  let panel=null;
+  if(notesProjet&&detail===null){
+    const projNotes=(notes?.rows||[]).filter(n=>Number(n.projet_id)===Number(notesProjet.id)).sort((a,b)=>toISO(b.date).localeCompare(toISO(a.date)));
+    panel=<SidePanel title={`Notes — ${notesProjet.name}`} onClose={()=>setNotesProjet(null)}>
+      <FG label="Titre (optionnel)"><Inp value={noteForm.titre} onChange={e=>setNoteForm(x=>({...x,titre:e.target.value}))} placeholder="Ex: Point chantier"/></FG>
+      <FG label="Note *"><Inp value={noteForm.contenu} onChange={e=>setNoteForm(x=>({...x,contenu:e.target.value}))} rows={3} placeholder="Saisir une note..."/></FG>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+        <Btn primary onClick={saveNote}><span className={savingNote?"spin":""}>{savingNote?"⟳":"+"}</span> Ajouter</Btn>
+      </div>
+      {!projNotes.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune note.</div>}
+      {projNotes.map(n=>(
+        <div key={n.id} style={{padding:"10px 12px",borderRadius:6,background:"#F9F9F9",marginBottom:8,border:"0.5px solid #DDDDDD"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <div>{n.titre&&<div style={{fontSize:13,fontWeight:700}}>{n.titre}</div>}<div style={{fontSize:11,color:"#7A7A7A",fontFamily:"'DM Mono',monospace"}}>{fmt(n.date)}</div></div>
+            <button onClick={()=>notes.remove(n.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#7A7A7A"}}>✕</button>
+          </div>
+          <div style={{fontSize:13,color:"#3A3A3A",whiteSpace:"pre-wrap",lineHeight:1.6}}>{n.contenu}</div>
+        </div>
+      ))}
+    </SidePanel>;
+  } else if(open){
+    panel=<SidePanel title={editing?"Modifier le projet":"Nouveau projet"} onClose={()=>{setOpen(false);setEditing(null);}}>
+      <FG label="Nom du projet *"><Inp value={form.name} onChange={e=>f("name",e.target.value)} placeholder="Ex: Façade ETFE Lyon"/></FG>
+      <FG label="Client / maître d'ouvrage"><Inp value={form.client||""} onChange={e=>f("client",e.target.value)} placeholder="Ex: Société ABC"/></FG>
+      <FG label="Lieu / chantier"><Inp value={form.lieu||""} onChange={e=>f("lieu",e.target.value)} placeholder="Ex: Lyon"/></FG>
+      <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{PROJ_STATUTS.map(s=><option key={s}>{s}</option>)}</Sel></FG>
+      <FG label="Avancement (%)"><Inp type="number" value={form.avancement} onChange={e=>f("avancement",e.target.value)}/></FG>
+      <FG label="Budget (€)"><Inp type="number" value={form.budget} onChange={e=>f("budget",e.target.value)}/></FG>
+      <FG label="Dépensé (€)"><Inp type="number" value={form.depense} onChange={e=>f("depense",e.target.value)}/></FG>
+      <FG label="Nb personnes"><Inp type="number" value={form.equipe} onChange={e=>f("equipe",e.target.value)}/></FG>
+      <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+      <ErrMsg msg={err}/><PanelBtns onCancel={()=>{setOpen(false);setEditing(null);}} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Créer"}/>
+    </SidePanel>;
+  }
+
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <div style={{display:"flex",gap:8,alignItems:"center"}}>
+        <div style={{fontSize:15,fontWeight:700,color:"#1C1C1C",borderLeft:"3px solid #CC2222",paddingLeft:8}}>Projets actifs ({actifs.length})</div>
+        {historique.length>0&&<button onClick={()=>setShowHistorique(h=>!h)} style={{fontSize:12,color:"#7A7A7A",background:"none",border:"1px solid #DDDDDD",borderRadius:4,padding:"3px 8px",cursor:"pointer",fontFamily:"'DM Sans',sans-serif"}}>{showHistorique?"Masquer":"Voir"} historique ({historique.length})</button>}
+      </div>
+      <Btn primary onClick={()=>{setNotesProjet(null);setDetail(null);setEditing(null);setForm(EP);setErr("");setOpen(true);}}>+ Nouveau projet</Btn>
+    </div>
+    {sheet.loading&&<div style={{fontSize:13,color:"#7A7A7A",padding:12}}>Chargement...</div>}
+    {!actifs.length&&!sheet.loading&&<Bd style={{textAlign:"center",padding:24,color:"#7A7A7A",fontSize:13,marginBottom:10}}>Aucun projet actif.</Bd>}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+      {actifs.map(p=>{
+        const c=STATUT_COLORS[p.statut]||{bg:"#F2F0ED",tx:"#3A3A3A"};
+        const bp=p.budget>0?Math.round(p.depense/p.budget*100):0;
+        const nbNotes=(notes?.rows||[]).filter(n=>Number(n.projet_id)===Number(p.id)).length;
+        return(
+          <Bd key={p.id} style={{cursor:"pointer"}} onClick={()=>{setNotesProjet(null);setOpen(false);setDetail(p.id);}}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:700,color:"#1C1C1C"}}>{p.name}</div>
+                {p.client&&<div style={{fontSize:12,color:"#7A7A7A"}}>{p.client}</div>}
+                {p.lieu&&<div style={{fontSize:12,color:"#7A7A7A"}}>{p.lieu}</div>}
+              </div>
+              <div style={{display:"flex",gap:4,alignItems:"flex-start"}} onClick={e=>e.stopPropagation()}>
+                {nbNotes>0&&<span style={{background:"#CC2222",color:"#fff",borderRadius:10,fontSize:10,padding:"1px 6px",fontWeight:700}}>{nbNotes}</span>}
+                <button onClick={e=>{e.stopPropagation();setNotesProjet(null);setEditing(p.id);setForm({...p,budget:p.budget??"",depense:p.depense??""});setErr("");setOpen(true);}} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:11,padding:"2px 8px",color:"#3A3A3A",fontFamily:"'DM Sans',sans-serif"}}>Modifier</button>
+                <button onClick={e=>{e.stopPropagation();if(confirm("Supprimer ?"))sheet.remove(p.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#CC2222"}}>✕</button>
+              </div>
+            </div>
+            <Badge label={p.statut} bg={c.bg} color={c.tx}/>
+            <div style={{fontSize:12,color:"#7A7A7A",marginTop:8}}>Avancement : {p.avancement}%</div><PBar val={p.avancement}/>
+            {p.budget>0&&<><div style={{fontSize:12,color:"#7A7A7A",marginTop:6}}>{Number(p.depense).toLocaleString("fr-FR")} € / {Number(p.budget).toLocaleString("fr-FR")} €</div><PBar val={bp}/></>}
+            <div style={{fontSize:11,color:"#CC2222",marginTop:8,fontWeight:500}}>Cliquer pour le détail →</div>
+          </Bd>
+        );
+      })}
+    </div>
+    {showHistorique&&historique.length>0&&(
+      <div style={{marginTop:16}}>
+        <div style={{fontSize:13,fontWeight:700,color:"#7A7A7A",borderLeft:"3px solid #DDDDDD",paddingLeft:8,marginBottom:10}}>Projets terminés ({historique.length})</div>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+          {historique.map(p=>(
+            <Bd key={p.id} style={{opacity:.7,cursor:"pointer"}} onClick={()=>setDetail(p.id)}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+                <div><div style={{fontSize:13,fontWeight:700,color:"#3A3A3A",textDecoration:"line-through"}}>{p.name}</div>{p.client&&<div style={{fontSize:12,color:"#7A7A7A"}}>{p.client}</div>}</div>
+                <Badge label="Terminé" bg="#E6F9EE" color="#1A6B3A"/>
+              </div>
+              {p.budget>0&&<div style={{fontSize:12,color:"#7A7A7A"}}>{Number(p.depense).toLocaleString("fr-FR")} € / {Number(p.budget).toLocaleString("fr-FR")} €</div>}
+            </Bd>
+          ))}
+        </div>
+      </div>
+    )}
+  </WithPanel>;
+}
   const [open,setOpen]=useState(false);
   const [form,setForm]=useState(EP);
   const [editing,setEditing]=useState(null);
@@ -640,6 +961,98 @@ function Projets({sheet,notes,tasks,orders,stocks,events}){
         </div>
       </div>
     )}
+  </WithPanel>;
+}
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EP);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const [notesProjet,setNotesProjet]=useState(null);
+  const [noteForm,setNoteForm]=useState({titre:"",contenu:""});
+  const [savingNote,setSavingNote]=useState(false);
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  async function save(){
+    if(!form.name.trim()){setErr("Nom obligatoire.");return;}
+    setSaving(true);setErr("");
+    try{const item={...form,avancement:+form.avancement||0,equipe:+form.equipe||0,budget:+form.budget||0,depense:+form.depense||0};
+      if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}
+    catch(e){setErr(e.message);}setSaving(false);
+  }
+  async function saveNote(){
+    if(!noteForm.contenu.trim())return;
+    setSavingNote(true);
+    try{await notes.add({projet_id:notesProjet.id,date:TODAY,titre:noteForm.titre,contenu:noteForm.contenu});setNoteForm({titre:"",contenu:""});}catch(e){}
+    setSavingNote(false);
+  }
+  let panel=null;
+  if(notesProjet){
+    const projNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(notesProjet.id)).sort((a,b)=>b.date.localeCompare(a.date));
+    panel=<SidePanel title={`Notes — ${notesProjet.name}`} onClose={()=>setNotesProjet(null)}>
+      <FG label="Titre (optionnel)"><Inp value={noteForm.titre} onChange={e=>setNoteForm(x=>({...x,titre:e.target.value}))} placeholder="Ex: Point chantier"/></FG>
+      <FG label="Note *"><Inp value={noteForm.contenu} onChange={e=>setNoteForm(x=>({...x,contenu:e.target.value}))} rows={3} placeholder="Saisir une note..."/></FG>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+        <Btn primary onClick={saveNote}><span className={savingNote?"spin":""}>{savingNote?"⟳":"+"}</span> Ajouter</Btn>
+      </div>
+      {!projNotes.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune note pour ce projet.</div>}
+      {projNotes.map(n=>(
+        <div key={n.id} style={{padding:"10px 12px",borderRadius:6,background:"#F9F9F9",marginBottom:8,border:"0.5px solid #DDDDDD"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <div>{n.titre&&<div style={{fontSize:13,fontWeight:700,color:"#1C1C1C"}}>{n.titre}</div>}<div style={{fontSize:11,color:"#7A7A7A",fontFamily:"'DM Mono',monospace"}}>{fmt(n.date)}</div></div>
+            <button onClick={()=>notes.remove(n.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#7A7A7A"}}>✕</button>
+          </div>
+          <div style={{fontSize:13,color:"#3A3A3A",whiteSpace:"pre-wrap",lineHeight:1.6}}>{n.contenu}</div>
+        </div>
+      ))}
+    </SidePanel>;
+  } else if(open){
+    panel=<SidePanel title={editing?"Modifier le projet":"Nouveau projet"} onClose={()=>setOpen(false)}>
+      <FG label="Nom du projet *"><Inp value={form.name} onChange={e=>f("name",e.target.value)} placeholder="Ex: Façade ETFE Lyon"/></FG>
+      <FG label="Client / maître d'ouvrage"><Inp value={form.client||""} onChange={e=>f("client",e.target.value)} placeholder="Ex: Société ABC"/></FG>
+      <FG label="Lieu / chantier"><Inp value={form.lieu||""} onChange={e=>f("lieu",e.target.value)} placeholder="Ex: Lyon"/></FG>
+      <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{PROJ_STATUTS.map(s=><option key={s}>{s}</option>)}</Sel></FG>
+      <FG label="Avancement (%)"><Inp type="number" value={form.avancement} onChange={e=>f("avancement",e.target.value)}/></FG>
+      <FG label="Budget (€)"><Inp type="number" value={form.budget} onChange={e=>f("budget",e.target.value)}/></FG>
+      <FG label="Dépensé (€)"><Inp type="number" value={form.depense} onChange={e=>f("depense",e.target.value)}/></FG>
+      <FG label="Nb personnes"><Inp type="number" value={form.equipe} onChange={e=>f("equipe",e.target.value)}/></FG>
+      <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+      <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Créer"}/>
+    </SidePanel>;
+  }
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+      <div style={{fontSize:15,fontWeight:700,color:"#1C1C1C",borderLeft:"3px solid #CC2222",paddingLeft:8}}>Projets ({sheet.rows.length})</div>
+      <Btn primary onClick={()=>{setNotesProjet(null);setEditing(null);setForm(EP);setErr("");setOpen(true);}}>+ Nouveau projet</Btn>
+    </div>
+    {sheet.loading&&<div style={{fontSize:13,color:"#7A7A7A",padding:12}}>Chargement...</div>}
+    {!sheet.rows.length&&!sheet.loading&&<Bd style={{textAlign:"center",padding:24,color:"#7A7A7A",fontSize:13}}>Aucun projet. Créez votre premier projet.</Bd>}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+      {sheet.rows.map(p=>{
+        const c=statutBadge(p.statut);const bp=p.budget>0?Math.round(p.depense/p.budget*100):0;
+        const nbNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(p.id)).length;
+        return(
+          <Bd key={p.id}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:8}}>
+              <div>
+                <div style={{fontSize:14,fontWeight:700,color:"#1C1C1C"}}>{p.name}</div>
+                {p.client&&<div style={{fontSize:12,color:"#7A7A7A"}}>{p.client}</div>}
+                {p.lieu&&<div style={{fontSize:12,color:"#7A7A7A"}}>{p.lieu}</div>}
+              </div>
+              <div style={{display:"flex",gap:4,alignItems:"flex-start"}}>
+                <button onClick={()=>{setOpen(false);setNotesProjet(p);}} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:11,padding:"2px 8px",color:"#3A3A3A",display:"flex",alignItems:"center",gap:4,fontFamily:"'DM Sans',sans-serif"}}>
+                  Notes{nbNotes>0&&<span style={{background:"#CC2222",color:"#fff",borderRadius:10,fontSize:10,padding:"0 5px",fontWeight:700}}>{nbNotes}</span>}
+                </button>
+                <button onClick={()=>{setNotesProjet(null);setEditing(p.id);setForm({...p});setErr("");setOpen(true);}} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:11,padding:"2px 8px",color:"#3A3A3A",fontFamily:"'DM Sans',sans-serif"}}>Modifier</button>
+                <button onClick={()=>{if(confirm("Supprimer ce projet ?"))sheet.remove(p.id);}} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:11,padding:"2px 8px",color:"#CC2222",fontFamily:"'DM Sans',sans-serif"}}>Suppr.</button>
+              </div>
+            </div>
+            <Badge label={p.statut} bg={c.bg} color={c.tx}/>
+            <div style={{fontSize:12,color:"#7A7A7A",marginTop:8}}>Avancement : {p.avancement}%</div><PBar val={p.avancement}/>
+            {p.budget>0&&<><div style={{fontSize:12,color:"#7A7A7A",marginTop:6}}>{Number(p.depense).toLocaleString("fr-FR")} € / {Number(p.budget).toLocaleString("fr-FR")} €</div><PBar val={bp}/></>}
+          </Bd>
+        );
+      })}
+    </div>
   </WithPanel>;
 }
 
@@ -1010,6 +1423,9 @@ function Taches({sheet,projects}){
 }
 
 // ══ CALENDRIER ══
+const EV_COLORS={rdv:"#2A7A2A",deadline:"#CC2222",chantier:"#3A3A3A",livraison:"#7A7A7A",reunion:"#CC2222"};
+const EV_LABELS={rdv:"RDV",deadline:"Deadline",chantier:"Chantier",livraison:"Livraison",reunion:"Réunion"};
+
 function Calendrier({sheet,projects}){
   const [year,setYear]=useState(()=>new Date().getFullYear());
   const [month,setMonth]=useState(()=>new Date().getMonth());
@@ -1197,17 +1613,21 @@ function Calendrier({sheet,projects}){
 const EM={nom:"",role:"",statut:"chantier",loc:"",tel:"",email:"",note:""};
 const AVATARS_BG=["#F2F0ED:#CC2222","#FFF0F0:#CC2222","#F0FFF0:#2A7A2A","#F2F0ED:#3A3A3A","#FFF0F0:#CC2222","#F0FFF0:#2A7A2A"];
 function initials(n){return n.split(" ").map(x=>x[0]||"").join("").slice(0,2).toUpperCase();}
-function Equipes({sheet,journal}){
+function Equipes({sheet,journal,projects}){
   const [open,setOpen]=useState(false);
   const [form,setForm]=useState(EM);
   const [editing,setEditing]=useState(null);
   const [saving,setSaving]=useState(false);
   const [err,setErr]=useState("");
   const [jtext,setJtext]=useState("");
+  const [jprojet,setJprojet]=useState("");
   const f=(k,v)=>setForm(x=>({...x,[k]:v}));
   async function save(){if(!form.nom.trim()){setErr("Nom obligatoire.");return;}setSaving(true);setErr("");try{if(editing){await sheet.update(editing,form);}else{await sheet.add(form);}setOpen(false);}catch(e){setErr(e.message);}setSaving(false);}
-  async function saveJ(){if(!jtext.trim())return;await journal.add({date:TODAY,texte:jtext});setJtext("");}
-  const sb=(s)=>({chantier:{bg:"#FFF0F0",tx:"#CC2222"},atelier:{bg:"#F2F0ED",tx:"#3A3A3A"},bureau:{bg:"#F2F0ED",tx:"#7A7A7A"},congé:{bg:"#F2F0ED",tx:"#7A7A7A"},déplacement:{bg:"#F0FFF0",tx:"#2A7A2A"}}[s]||{bg:"#F2F0ED",tx:"#3A3A3A"});
+  async function saveJ(){
+    if(!jtext.trim())return;
+    await journal.add({date:TODAY,texte:jtext,projet:jprojet});
+    setJtext("");setJprojet("");
+  }  const sb=(s)=>({chantier:{bg:"#FFF0F0",tx:"#CC2222"},atelier:{bg:"#F2F0ED",tx:"#3A3A3A"},bureau:{bg:"#F2F0ED",tx:"#7A7A7A"},congé:{bg:"#F2F0ED",tx:"#7A7A7A"},déplacement:{bg:"#F0FFF0",tx:"#2A7A2A"}}[s]||{bg:"#F2F0ED",tx:"#3A3A3A"});
   const panel=open&&<SidePanel title={editing?"Modifier le membre":"Nouveau membre"} onClose={()=>setOpen(false)}>
     <FG label="Nom complet *"><Inp value={form.nom} onChange={e=>f("nom",e.target.value)} placeholder="Ex: Marc Dupont"/></FG>
     <FG label="Rôle / poste"><Inp value={form.role} onChange={e=>f("role",e.target.value)} placeholder="Ex: Chef d'équipe chantier"/></FG>
@@ -1246,12 +1666,18 @@ function Equipes({sheet,journal}){
     </div>
     <Bd>
       <SecTitle>Journal de chantier</SecTitle>
+      <FG label="Lié au projet">
+        <Sel value={jprojet} onChange={e=>setJprojet(e.target.value)}>
+          <option value="">— Aucun —</option>
+          {projects.rows.map(p=><option key={p.id}>{p.name}</option>)}
+        </Sel>
+      </FG>
       <Inp value={jtext} onChange={e=>setJtext(e.target.value)} rows={3} placeholder={`Compte-rendu du ${fmt(TODAY)} — observations, conditions météo, incidents...`}/>
       <div style={{display:"flex",justifyContent:"flex-end",marginTop:10}}><Btn primary onClick={saveJ}>Enregistrer</Btn></div>
       {journal.rows.slice(0,5).map(j=>(
         <div key={j.id} style={{marginTop:10,padding:"10px 12px",background:"#F9F9F9",borderRadius:6,border:"0.5px solid #DDDDDD",display:"flex",gap:8}}>
           <div style={{flex:1}}>
-            <div style={{fontSize:11,color:"#7A7A7A",marginBottom:3,fontFamily:"'DM Mono',monospace"}}>{fmt(j.date)}</div>
+            <div style={{fontSize:11,color:"#7A7A7A",marginBottom:3,fontFamily:"'DM Mono',monospace"}}>{fmt(j.date)}{j.projet&&<span style={{marginLeft:6,color:"#185FA5"}}>→ {j.projet}</span>}</div>
             <div style={{fontSize:13,color:"#1C1C1C",lineHeight:1.6}}>{j.texte}</div>
           </div>
           <button onClick={()=>journal.remove(j.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#7A7A7A",alignSelf:"flex-start"}}>✕</button>
@@ -1369,8 +1795,150 @@ function Stocks({sheet,fournisseurs}){
 }
 
 // ══ COMMANDES ══
-const EO={ref:"",fourn:"",article:"",qty:"",unit:"pcs",prix:"",cat:"",loc:"",date:TODAY};
-function Commandes({sheet,stocks,fournisseurs}){
+const EO={ref:"",fourn:"",article:"",qty:"",unit:"pcs",prix:"",cat:"",loc:"",date:TODAY,projet:""};
+function Commandes({sheet,stocks,fournisseurs,projects}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EO);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  const isBool=v=>v===true||v==="TRUE";
+
+  // Logique : "Reçue" coché → stock mis à jour + passe en zone intermédiaire
+  // "Facture transmise" coché → passe en historique
+  // Décocher "Reçue" → retire du stock et repasse en cours
+  async function toggleRecue(o){
+    const wasRecue=isBool(o.recue);
+    if(!wasRecue){
+      // Marquer reçue → ajouter au stock
+      await addToStock(o);
+      await sheet.update(o.id,{...o,recue:true,passee:true});
+    } else {
+      // Décocher reçue → retirer du stock
+      await removeFromStock(o);
+      await sheet.update(o.id,{...o,recue:false,factureCompta:false});
+    }
+  }
+
+  async function toggleFacture(o){
+    await sheet.update(o.id,{...o,factureCompta:!isBool(o.factureCompta)});
+  }
+
+  async function addToStock(ord){
+    const idx=stocks.rows.findIndex(s=>s.ref.toLowerCase()===ord.article.toLowerCase());
+    if(idx>=0){const s=stocks.rows[idx];await stocks.update(s.id,{...s,qty:Number(s.qty)+(+ord.qty||0)});}
+    else{await stocks.add({ref:ord.article,cat:ord.cat||"",qty:+ord.qty||0,min:0,unit:ord.unit||"pcs",prix:+ord.prix||0,loc:ord.loc||"",fourn:ord.fourn||""});}
+  }
+
+  async function removeFromStock(ord){
+    const idx=stocks.rows.findIndex(s=>s.ref.toLowerCase()===ord.article.toLowerCase());
+    if(idx>=0){const s=stocks.rows[idx];await stocks.update(s.id,{...s,qty:Math.max(0,Number(s.qty)-(+ord.qty||0))});}
+  }
+
+  async function save(){
+    if(!form.article.trim()){setErr("Article obligatoire.");return;}
+    if(!form.fourn.trim()){setErr("Fournisseur obligatoire.");return;}
+    setSaving(true);setErr("");
+    try{await sheet.add({...form,qty:+form.qty||0,prix:+form.prix||0,passee:false,recue:false,factureCompta:false});setOpen(false);setForm(EO);}
+    catch(e){setErr(e.message);}setSaving(false);
+  }
+
+  // 3 zones
+  const encours=sheet.rows.filter(o=>!isBool(o.recue));
+  const recuesSansFacture=sheet.rows.filter(o=>isBool(o.recue)&&!isBool(o.factureCompta));
+  const historique=sheet.rows.filter(o=>isBool(o.recue)&&isBool(o.factureCompta));
+
+  const montantTotal=(liste)=>liste.reduce((s,o)=>s+Number(o.qty||0)*Number(o.prix||0),0);
+
+  const panel=open&&<SidePanel title="Nouvelle commande" onClose={()=>setOpen(false)}>
+    <FG label="Référence commande"><Inp value={form.ref} onChange={e=>f("ref",e.target.value)} placeholder="CMD-001"/></FG>
+    <FG label="Date"><Inp type="date" value={form.date} onChange={e=>f("date",e.target.value)}/></FG>
+    <FG label="Article / désignation *"><Inp value={form.article} onChange={e=>f("article",e.target.value)} placeholder="Ex: Profilés keder 2m"/></FG>
+    <FG label="Fournisseur *"><Sel value={form.fourn} onChange={e=>f("fourn",e.target.value)}><option value="">— Choisir —</option>{fournisseurs.rows.map(x=><option key={x.id}>{x.nom}</option>)}<option value="Autre">Autre</option></Sel></FG>
+    <FG label="Projet"><Sel value={form.projet} onChange={e=>f("projet",e.target.value)}><option value="">— Aucun —</option>{projects.rows.map(p=><option key={p.id}>{p.name}</option>)}</Sel></FG>
+    <FG label="Quantité"><Inp type="number" value={form.qty} onChange={e=>f("qty",e.target.value)} placeholder="0"/></FG>
+    <FG label="Unité"><Sel value={form.unit} onChange={e=>f("unit",e.target.value)}>{UNITS.map(u=><option key={u}>{u}</option>)}</Sel></FG>
+    <FG label="Prix unitaire (€)"><Inp type="number" value={form.prix} onChange={e=>f("prix",e.target.value)} placeholder="0.00"/></FG>
+    <FG label="Catégorie stock"><Sel value={form.cat} onChange={e=>f("cat",e.target.value)}><option value="">— Choisir —</option>{CATS.map(c=><option key={c}>{c}</option>)}</Sel></FG>
+    <FG label="Emplacement"><Inp value={form.loc} onChange={e=>f("loc",e.target.value)} placeholder="Ex: Rack B2"/></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel="Créer"/>
+  </SidePanel>;
+
+  // Ligne commande réutilisable
+  const CmdRow=({o,showFacture=false})=>(
+    <div style={{padding:"12px 0",borderBottom:"0.5px solid #EEEEEE"}}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+        <div>
+          <span style={{fontSize:13,fontWeight:700,color:"#1C1C1C"}}>{o.article}</span>
+          {o.ref&&<span style={{fontSize:11,color:"#7A7A7A",marginLeft:8,fontFamily:"'DM Mono',monospace"}}>{o.ref}</span>}
+          {o.projet&&<span style={{fontSize:11,color:"#185FA5",marginLeft:8}}>→ {o.projet}</span>}
+        </div>
+        <div style={{display:"flex",alignItems:"center",gap:8}}>
+          <span style={{fontSize:12,fontWeight:700,color:"#3A3A3A"}}>{(Number(o.qty||0)*Number(o.prix||0)).toLocaleString("fr-FR")} €</span>
+          <button onClick={()=>sheet.remove(o.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"#7A7A7A"}}>✕</button>
+        </div>
+      </div>
+      <div style={{fontSize:12,color:"#7A7A7A",marginBottom:8}}>{o.fourn} · {o.qty} {o.unit} · {fmt(o.date)}</div>
+      <div style={{display:"flex",gap:16,alignItems:"center"}}>
+        <Check checked={isBool(o.recue)} onChange={()=>toggleRecue(o)} label="Reçue → stock mis à jour" color="#2A7A2A"/>
+        {showFacture&&isBool(o.recue)&&<Check checked={isBool(o.factureCompta)} onChange={()=>toggleFacture(o)} label="Facture transmise" color="#CC2222"/>}
+      </div>
+    </div>
+  );
+
+  return <WithPanel panel={panel}>
+    {/* KPIs */}
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:14}}>
+      {[
+        {val:encours.length,lbl:"En cours",sub:`${montantTotal(encours).toLocaleString("fr-FR")} €`},
+        {val:recuesSansFacture.length,lbl:"Reçues — facture en attente",alert:recuesSansFacture.length>0,sub:`${montantTotal(recuesSansFacture).toLocaleString("fr-FR")} €`},
+        {val:historique.length,lbl:"Archivées",sub:`${montantTotal(historique).toLocaleString("fr-FR")} €`},
+      ].map((m,i)=>(
+        <div key={i} style={{background:"#fff",border:"0.5px solid #DDDDDD",borderTop:m.alert?"3px solid #CC8800":"3px solid #F2F0ED",borderRadius:8,padding:"12px 14px"}}>
+          <div style={{fontSize:18,fontWeight:700,color:m.alert?"#CC8800":"#1C1C1C"}}>{m.val}</div>
+          <div style={{fontSize:12,color:"#7A7A7A",marginTop:2}}>{m.lbl}</div>
+          <div style={{fontSize:11,color:"#3A3A3A",marginTop:4,fontWeight:500}}>{m.sub}</div>
+        </div>
+      ))}
+    </div>
+
+    {recuesSansFacture.length>0&&<div style={{background:"#FFF8EC",border:"0.5px solid #CC8800",borderLeft:"3px solid #CC8800",borderRadius:6,padding:"8px 12px",marginBottom:12,fontSize:13,color:"#CC8800"}}>{recuesSansFacture.length} commande(s) reçue(s) en attente de facture comptabilité.</div>}
+
+    {/* Zone 1 : En cours */}
+    <Bd style={{marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <SecTitle>Commandes en cours ({encours.length})</SecTitle>
+        <Btn primary onClick={()=>{setErr("");setForm(EO);setOpen(true);}}>+ Nouvelle commande</Btn>
+      </div>
+      {!encours.length&&<div style={{fontSize:13,color:"#7A7A7A"}}>Aucune commande en cours.</div>}
+      {encours.map(o=><CmdRow key={o.id} o={o} showFacture={false}/>)}
+    </Bd>
+
+    {/* Zone 2 : Reçues sans facture */}
+    {recuesSansFacture.length>0&&<Bd style={{marginBottom:12}}>
+      <SecTitle>Reçues — en attente de facture ({recuesSansFacture.length})</SecTitle>
+      <div style={{fontSize:12,color:"#7A7A7A",marginBottom:10}}>Stock mis à jour. Cocher "Facture transmise" pour archiver.</div>
+      {recuesSansFacture.map(o=><CmdRow key={o.id} o={o} showFacture={true}/>)}
+    </Bd>}
+
+    {/* Zone 3 : Historique */}
+    {historique.length>0&&<Bd>
+      <SecTitle>Historique — archivées ({historique.length})</SecTitle>
+      {historique.map(o=>(
+        <div key={o.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"0.5px solid #EEEEEE"}}>
+          <div style={{flex:1}}>
+            <div style={{fontSize:13,color:"#7A7A7A",textDecoration:"line-through"}}>{o.article}</div>
+            <div style={{fontSize:11,color:"#7A7A7A",fontFamily:"'DM Mono',monospace"}}>{o.fourn} · {fmt(o.date)}{o.projet&&` · ${o.projet}`}</div>
+          </div>
+          <span style={{fontSize:12,fontWeight:500,color:"#3A3A3A"}}>{(Number(o.qty||0)*Number(o.prix||0)).toLocaleString("fr-FR")} €</span>
+          <Badge label="Facture OK" bg="#E6F9EE" color="#1A6B3A"/>
+          {/* Permet de décocher depuis l'historique */}
+          <button onClick={()=>toggleRecue(o)} style={{background:"none",border:"1px solid #DDDDDD",borderRadius:4,cursor:"pointer",fontSize:10,padding:"2px 6px",color:"#7A7A7A",fontFamily:"'DM Sans',sans-serif"}}>Annuler</button>
+        </div>
+      ))}
+    </Bd>}
+  </WithPanel>;
+}
   const [open,setOpen]=useState(false);
   const [form,setForm]=useState(EO);
   const [saving,setSaving]=useState(false);
@@ -1479,10 +2047,7 @@ function App(){
   const stocks=useSheet("stocks");
   const orders=useSheet("orders");
   const notes=useSheet("notes");
-  const prestataires=useSheet("prestataires");
-  const prestMissions=useSheet("prestMissions");
-  const atelierChantier=useSheet("atelierChantier");
-  const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders,notes,prestataires,prestMissions,atelierChantier};
+  const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders,notes};
 
   useEffect(()=>{
     const onUnhandled=(event)=>{
@@ -1540,16 +2105,16 @@ function App(){
       {/* Content */}
       <div style={{flex:1,padding:20}}>
         {panel==="dashboard"      &&<Dashboard sheets={sheets}/>}
-        {panel==="projets"        &&<Projets sheet={projects} notes={notes} tasks={tasks} orders={orders} stocks={stocks} events={events}/>}
+        {panel==="projets"        &&<Projets sheet={projects} notes={notes} tasks={tasks} orders={orders} stocks={stocks} events={events} prestMissions={prestMissions} atelierChantier={atelierChantier}/>}
         {panel==="taches"         &&<Taches sheet={tasks} projects={projects}/>}
         {panel==="calendrier"     &&<Calendrier sheet={events} projects={projects}/>}
-        {panel==="equipes"        &&<Equipes sheet={team} journal={journal}/>}
+        {panel==="equipes"        &&<Equipes sheet={team} journal={journal} projects={projects}/>}
         {panel==="atelier"        &&<MissionModule moduleType="atelier" sheet={atelierChantier} projects={projects} team={team} stocks={stocks}/>}
         {panel==="chantier"       &&<MissionModule moduleType="chantier" sheet={atelierChantier} projects={projects} team={team} stocks={stocks}/>}
         {panel==="prestataires"   &&<Prestataires sheet={prestataires} missions={prestMissions} projects={projects} stocks={stocks}/>}
         {panel==="fournisseurs"   &&<Fournisseurs sheet={fournisseurs}/>}
         {panel==="stocks"         &&<Stocks sheet={stocks} fournisseurs={fournisseurs}/>}
-        {panel==="commandes"      &&<Commandes sheet={orders} stocks={stocks} fournisseurs={fournisseurs}/>}
+        {panel==="commandes"      &&<Commandes sheet={orders} stocks={stocks} fournisseurs={fournisseurs} projects={projects}/>}
       </div>
       {/* Footer */}
       <div style={{textAlign:"center",padding:"10px 20px",fontSize:10,color:"#7A7A7A",borderTop:"0.5px solid #DDDDDD",background:"#fff",fontFamily:"'DM Sans',sans-serif"}}>
@@ -1562,6 +2127,760 @@ function App(){
 ReactDOM.createRoot(document.getElementById("root")).render(
   <ErrorBoundary><App/></ErrorBoundary>
 );
+</script>
+</body>
+</html><!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>BTP Manager</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0;}
+    body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f3;color:#1a1a1a;}
+    :root{
+      --bg-primary:#ffffff;--bg-secondary:#f5f5f3;--bg-tertiary:#eeede9;
+      --border:#e5e4e0;--border-light:#eeede9;
+      --text-primary:#1a1a1a;--text-secondary:#666;--text-tertiary:#999;
+      --green:#1D9E75;--red:#E24B4A;--amber:#EF9F27;--blue:#378ADD;--purple:#7F77DD;
+    }
+    button:focus{outline:none;}
+    input,select,textarea{font-family:inherit;}
+    @keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+    .spin{display:inline-block;animation:spin 1s linear infinite;}
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useCallback } = React;
+
+const GAS_URL = "https://script.google.com/macros/s/AKfycbwb3hMTcB1HYK_blQwojA52MQ145Eew8U2XgjxCcvkRicROHOsJHUvrH5lZZIBpZYCs/exec";
+const VERSION = "v1.2";
+
+// ── API via JSONP ──
+function jsonp(params) {
+  return new Promise((resolve, reject) => {
+    const cb = "cb_" + Math.random().toString(36).slice(2);
+    const script = document.createElement("script");
+    const url = GAS_URL + "?" + new URLSearchParams({...params, callback: cb}).toString();
+    window[cb] = (data) => { delete window[cb]; document.head.removeChild(script); resolve(data); };
+    script.onerror = () => { delete window[cb]; document.head.removeChild(script); reject(new Error("Erreur réseau")); };
+    script.src = url;
+    document.head.appendChild(script);
+  });
+}
+async function gasGet(key) {
+  const r = await jsonp({ action:"get", key });
+  if (!r.ok) throw new Error(r.msg);
+  return r.data;
+}
+async function gasAction(action, key, data, id) {
+  const params = { action, key };
+  if (data) params.data = JSON.stringify(data);
+  if (id !== undefined) params.id = id;
+  const r = await jsonp(params);
+  if (!r.ok) throw new Error(r.msg);
+  return r.data ?? r;
+}
+const gasAdd    = (key, data)     => gasAction("add",    key, data);
+const gasUpdate = (key, id, data) => gasAction("update", key, data, id);
+const gasDelete = (key, id)       => gasAction("delete", key, null, id);
+const gasInit   = ()              => jsonp({ action:"init" });
+
+const TODAY = new Date().toISOString().split("T")[0];
+const todayDate = new Date(TODAY+"T00:00:00");
+const MONTHS=["Janvier","Février","Mars","Avril","Mai","Juin","Juillet","Août","Septembre","Octobre","Novembre","Décembre"];
+function fmt(d){if(!d)return"—";const x=new Date(d+"T00:00:00");return x.getDate()+"/"+(x.getMonth()+1)+"/"+x.getFullYear();}
+function diffDays(d){return Math.ceil((new Date(d+"T00:00:00")-todayDate)/86400000);}
+const EV_COLORS={rdv:"#1D9E75",deadline:"#E24B4A",chantier:"#378ADD",livraison:"#EF9F27",reunion:"#7F77DD"};
+const EV_LABELS={rdv:"RDV",deadline:"Deadline",chantier:"Chantier",livraison:"Livraison",reunion:"Réunion"};
+const CATS=["Visserie & fixations","Profilés aluminium","Membranes ETFE","Acier structure","Étanchéité & joints","Outillage","EPI & sécurité","Autre"];
+const UNITS=["pcs","m²","ml","barres","kg","rouleaux","cartouches","boîtes"];
+const PROJ_STATUTS=["en cours","démarrage","finition","retard","terminé","en pause"];
+const STATUTS_TEAM=["chantier","atelier","bureau","congé","déplacement"];
+
+// ── UI atoms ──
+const Bd=({children,style})=><div style={{background:"var(--bg-primary)",border:"1px solid var(--border)",borderRadius:10,padding:14,...style}}>{children}</div>;
+const Badge=({label,bg,color})=><span style={{background:bg,color,fontSize:11,fontWeight:500,padding:"2px 8px",borderRadius:20,whiteSpace:"nowrap"}}>{label}</span>;
+const Btn=({children,onClick,primary,danger,small})=>(
+  <button onClick={onClick} style={{padding:small?"4px 10px":"7px 14px",borderRadius:8,fontSize:13,cursor:"pointer",
+    border:danger?"1px solid #E24B4A":primary?"1px solid #1D9E75":"1px solid var(--border)",
+    background:danger?"#FCEBEB":primary?"#1D9E75":"#fff",
+    color:danger?"#A32D2D":primary?"#fff":"var(--text-primary)",
+    display:"inline-flex",alignItems:"center",gap:5,whiteSpace:"nowrap"}}>{children}</button>
+);
+const Inp=({value,onChange,placeholder,type,rows})=>{
+  const s={width:"100%",padding:"7px 10px",borderRadius:7,border:"1px solid var(--border)",background:"#fff",color:"var(--text-primary)",fontSize:13,boxSizing:"border-box"};
+  if(rows)return <textarea value={value} onChange={onChange} placeholder={placeholder} rows={rows} style={{...s,resize:"vertical",fontFamily:"inherit"}}/>;
+  return <input type={type||"text"} value={value} onChange={onChange} placeholder={placeholder} style={s}/>;
+};
+const Sel=({value,onChange,children})=>(
+  <select value={value} onChange={onChange} style={{width:"100%",padding:"7px 10px",borderRadius:7,border:"1px solid var(--border)",background:"#fff",color:"var(--text-primary)",fontSize:13,boxSizing:"border-box"}}>{children}</select>
+);
+const FG=({label,children})=><div style={{marginBottom:10}}><div style={{fontSize:12,color:"var(--text-secondary)",marginBottom:3}}>{label}</div>{children}</div>;
+const PBar=({val})=>{const p=Math.min(100,Math.max(0,Number(val)||0));const c=p>=80?"#1D9E75":p>=40?"#EF9F27":"#E24B4A";return <div style={{height:4,borderRadius:2,background:"#eee",overflow:"hidden",marginTop:3}}><div style={{height:"100%",width:p+"%",background:c,borderRadius:2}}/></div>;};
+const ErrMsg=({msg})=>msg?<div style={{background:"#FCEBEB",color:"#A32D2D",border:"1px solid #F09595",borderRadius:7,padding:"7px 10px",fontSize:12,marginBottom:8}}>{msg}</div>:null;
+
+function Check({checked,onChange,label,color}){
+  const c=color||"#1D9E75";
+  return(
+    <label style={{display:"flex",alignItems:"center",gap:6,cursor:"pointer",userSelect:"none"}}>
+      <div onClick={onChange} style={{width:16,height:16,borderRadius:3,cursor:"pointer",flexShrink:0,border:`2px solid ${checked?c:"#aaa"}`,background:checked?c:"#fff",display:"flex",alignItems:"center",justifyContent:"center",transition:"all .15s"}}>
+        {checked&&<span style={{fontSize:10,color:"#fff",fontWeight:700,lineHeight:1}}>✓</span>}
+      </div>
+      {label&&<span style={{fontSize:12,color:"var(--text-primary)"}}>{label}</span>}
+    </label>
+  );
+}
+
+function SidePanel({title,onClose,children}){
+  return(
+    <div style={{width:280,flexShrink:0,background:"#fff",border:"1px solid var(--border)",borderRadius:10,padding:14,alignSelf:"flex-start",position:"sticky",top:14}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:12}}>
+        <span style={{fontSize:14,fontWeight:500}}>{title}</span>
+        <button onClick={onClose} style={{background:"none",border:"none",cursor:"pointer",fontSize:16,color:"var(--text-secondary)"}}>✕</button>
+      </div>
+      {children}
+    </div>
+  );
+}
+const PanelBtns=({onCancel,onSave,saving,saveLabel})=>(
+  <div style={{display:"flex",justifyContent:"flex-end",gap:8,marginTop:10}}>
+    <Btn onClick={onCancel}>Annuler</Btn>
+    <Btn primary onClick={onSave}><span className={saving?"spin":""}>{saving?"⟳":"✓"}</span> {saveLabel||"Enregistrer"}</Btn>
+  </div>
+);
+function WithPanel({panel,children}){
+  return <div style={{display:"flex",gap:14,alignItems:"flex-start"}}><div style={{flex:1,minWidth:0}}>{children}</div>{panel}</div>;
+}
+
+// ── Hook générique ──
+function useSheet(key){
+  const [rows,setRows]=useState([]);
+  const [loading,setLoading]=useState(true);
+  const [error,setError]=useState(null);
+  const load=useCallback(async()=>{
+    setLoading(true);
+    try{setRows(await gasGet(key));setError(null);}
+    catch(e){setError(e.message);}
+    finally{setLoading(false);}
+  },[key]);
+  useEffect(()=>{load();},[load]);
+  const add=async(data)=>{const c=await gasAdd(key,data);setRows(r=>[...r,c]);return c;};
+  const update=async(id,data)=>{await gasUpdate(key,id,data);setRows(r=>r.map(x=>Number(x.id)===Number(id)?{...x,...data}:x));};
+  const remove=async(id)=>{await gasDelete(key,id);setRows(r=>r.filter(x=>Number(x.id)!==Number(id)));};
+  return{rows,setRows,loading,error,reload:load,add,update,remove};
+}
+
+// ══ DASHBOARD ══
+function Dashboard({sheets}){
+  const {projects,tasks,stocks,orders,events}=sheets;
+  const pending=tasks.rows.filter(t=>!t.done&&t.done!=="TRUE");
+  const stockAlerts=stocks.rows.filter(s=>Number(s.qty)<Number(s.min));
+  const retards=projects.rows.filter(p=>p.statut==="retard");
+  const upcoming=[...events.rows].sort((a,b)=>a.date.localeCompare(b.date)).filter(e=>e.date>=TODAY).slice(0,5);
+  const loading=Object.values(sheets).some(s=>s.loading);
+  if(loading)return <Bd style={{textAlign:"center",padding:40}}><div style={{fontSize:24,marginBottom:8}} className="spin">⟳</div><div style={{fontSize:13,color:"var(--text-secondary)"}}>Chargement depuis Google Sheets...</div></Bd>;
+  const empty=!projects.rows.length&&!tasks.rows.length&&!events.rows.length;
+  if(empty)return <Bd style={{textAlign:"center",padding:40}}><div style={{fontSize:28,marginBottom:10}}>🏗️</div><div style={{fontSize:15,fontWeight:500,marginBottom:6}}>Bienvenue dans BTP Manager</div><div style={{fontSize:13,color:"var(--text-secondary)"}}>Connecté à Google Sheets. Commence par ajouter tes projets.</div></Bd>;
+  return(
+    <div>
+      {(retards.length>0||stockAlerts.length>0)&&<div style={{background:"#FCEBEB",border:"1px solid #F09595",borderRadius:8,padding:"9px 12px",marginBottom:14,fontSize:13,color:"#A32D2D"}}>⚠️ {retards.length>0&&`${retards.length} projet(s) en retard. `}{stockAlerts.length>0&&`${stockAlerts.length} référence(s) sous seuil.`}</div>}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:14}}>
+        {[{val:projects.rows.length,lbl:"Projets"},{val:pending.length,lbl:"Tâches"},{val:stockAlerts.length,lbl:"Alertes stock",red:stockAlerts.length>0},{val:orders.rows.filter(o=>!o.recue&&o.recue!=="TRUE").length,lbl:"Commandes"}].map((m,i)=>(
+          <div key={i} style={{background:"var(--bg-secondary)",borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+            <div style={{fontSize:20,fontWeight:500,color:m.red?"#A32D2D":"var(--text-primary)"}}>{m.val}</div>
+            <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:2}}>{m.lbl}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:12}}>
+        <Bd>
+          <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>✅ Tâches urgentes</div>
+          {!pending.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucune tâche urgente.</div>}
+          {pending.filter(t=>t.urgence==="high").slice(0,5).map(t=>(
+            <div key={t.id} style={{display:"flex",gap:8,padding:"7px 0",borderBottom:"1px solid var(--border-light)"}}>
+              <div style={{flex:1}}><div style={{fontSize:13,color:"#A32D2D"}}>{t.text}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{t.projet} · {fmt(t.due)}</div></div>
+            </div>
+          ))}
+        </Bd>
+        <Bd>
+          <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>📅 Prochains événements</div>
+          {!upcoming.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucun événement.</div>}
+          {upcoming.map(ev=>{const d=diffDays(ev.date);return(
+            <div key={ev.id} style={{display:"flex",gap:8,padding:"7px 8px",borderRadius:7,background:"var(--bg-secondary)",marginBottom:5}}>
+              <div style={{width:7,height:7,borderRadius:"50%",background:EV_COLORS[ev.type]||"#888",flexShrink:0,marginTop:4}}/>
+              <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{ev.title}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{ev.projet}</div></div>
+              <span style={{fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{d===0?"Auj.":d===1?"Demain":"J+"+d}</span>
+            </div>
+          );})}
+        </Bd>
+        <Bd>
+          <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>🏗️ Projets</div>
+          {!projects.rows.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucun projet.</div>}
+          {projects.rows.map(p=>{const sc=p.statut==="retard"?{bg:"#FCEBEB",tx:"#A32D2D"}:p.statut==="finition"?{bg:"#E1F5EE",tx:"#0F6E56"}:p.statut==="démarrage"?{bg:"#E6F1FB",tx:"#185FA5"}:{bg:"#FAEEDA",tx:"#854F0B"};return(
+            <div key={p.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"1px solid var(--border-light)"}}>
+              <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{p.name}</div><PBar val={p.avancement}/></div>
+              <Badge label={p.statut} bg={sc.bg} color={sc.tx}/>
+            </div>
+          );})}
+        </Bd>
+        <Bd>
+          <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:10}}>📦 Alertes stock</div>
+          {!stockAlerts.length&&<div style={{fontSize:13,color:"#0F6E56"}}>Tous les stocks OK.</div>}
+          {stockAlerts.map(s=>{const r=Number(s.qty)/Number(s.min);return(
+            <div key={s.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid var(--border-light)"}}>
+              <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{s.ref}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{s.qty}/{s.min} {s.unit}</div></div>
+              <Badge label={r<0.7?"Critique":"Bas"} bg={r<0.7?"#FCEBEB":"#FAEEDA"} color={r<0.7?"#A32D2D":"#854F0B"}/>
+            </div>
+          );})}
+        </Bd>
+      </div>
+    </div>
+  );
+}
+
+// ══ PROJETS ══
+const EP={name:"",statut:"en cours",avancement:0,equipe:0,budget:"",depense:"",client:"",lieu:"",note:""};
+function Projets({sheet,notes}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EP);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const [notesProjet,setNotesProjet]=useState(null);
+  const [noteForm,setNoteForm]=useState({titre:"",contenu:""});
+  const [savingNote,setSavingNote]=useState(false);
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+
+  async function save(){
+    if(!form.name.trim()){setErr("Nom obligatoire.");return;}
+    setSaving(true);setErr("");
+    try{const item={...form,avancement:+form.avancement||0,equipe:+form.equipe||0,budget:+form.budget||0,depense:+form.depense||0};
+      if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}
+    catch(e){setErr(e.message);}setSaving(false);
+  }
+
+  async function saveNote(){
+    if(!noteForm.contenu.trim())return;
+    setSavingNote(true);
+    try{await notes.add({projet_id:notesProjet.id,date:TODAY,titre:noteForm.titre,contenu:noteForm.contenu});
+      setNoteForm({titre:"",contenu:""});}catch(e){}
+    setSavingNote(false);
+  }
+
+  const sc=(s)=>({retard:{bg:"#FCEBEB",tx:"#A32D2D"},finition:{bg:"#E1F5EE",tx:"#0F6E56"},démarrage:{bg:"#E6F1FB",tx:"#185FA5"},terminé:{bg:"#EAF3DE",tx:"#3B6D11"}}[s]||{bg:"#FAEEDA",tx:"#854F0B"});
+
+  let panel=null;
+  if(notesProjet){
+    const projNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(notesProjet.id)).sort((a,b)=>b.date.localeCompare(a.date));
+    panel=<SidePanel title={`📝 Notes — ${notesProjet.name}`} onClose={()=>setNotesProjet(null)}>
+      <FG label="Titre (optionnel)"><Inp value={noteForm.titre} onChange={e=>setNoteForm(x=>({...x,titre:e.target.value}))} placeholder="Ex: Point chantier"/></FG>
+      <FG label="Note *"><Inp value={noteForm.contenu} onChange={e=>setNoteForm(x=>({...x,contenu:e.target.value}))} rows={3} placeholder="Saisir une note..."/></FG>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:14}}>
+        <Btn primary onClick={saveNote}><span className={savingNote?"spin":""}>{savingNote?"⟳":"+"}</span> Ajouter</Btn>
+      </div>
+      {!projNotes.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucune note pour ce projet.</div>}
+      {projNotes.map(n=>(
+        <div key={n.id} style={{padding:"10px 12px",borderRadius:8,background:"var(--bg-secondary)",marginBottom:8,border:"1px solid var(--border)"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <div>{n.titre&&<div style={{fontSize:13,fontWeight:500}}>{n.titre}</div>}<div style={{fontSize:11,color:"var(--text-secondary)"}}>{fmt(n.date)}</div></div>
+            <button onClick={()=>notes.remove(n.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"var(--text-tertiary)",alignSelf:"flex-start"}}>🗑</button>
+          </div>
+          <div style={{fontSize:13,color:"var(--text-primary)",whiteSpace:"pre-wrap"}}>{n.contenu}</div>
+        </div>
+      ))}
+    </SidePanel>;
+  } else if(open){
+    panel=<SidePanel title={editing?"Modifier projet":"Nouveau projet"} onClose={()=>setOpen(false)}>
+      <FG label="Nom *"><Inp value={form.name} onChange={e=>f("name",e.target.value)} placeholder="Ex: Façade ETFE Lyon"/></FG>
+      <FG label="Client"><Inp value={form.client||""} onChange={e=>f("client",e.target.value)} placeholder="Ex: Société ABC"/></FG>
+      <FG label="Lieu"><Inp value={form.lieu||""} onChange={e=>f("lieu",e.target.value)} placeholder="Ex: Lyon"/></FG>
+      <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{PROJ_STATUTS.map(s=><option key={s}>{s}</option>)}</Sel></FG>
+      <FG label="Avancement (%)"><Inp type="number" value={form.avancement} onChange={e=>f("avancement",e.target.value)}/></FG>
+      <FG label="Budget (€)"><Inp type="number" value={form.budget} onChange={e=>f("budget",e.target.value)}/></FG>
+      <FG label="Dépensé (€)"><Inp type="number" value={form.depense} onChange={e=>f("depense",e.target.value)}/></FG>
+      <FG label="Nb personnes"><Inp type="number" value={form.equipe} onChange={e=>f("equipe",e.target.value)}/></FG>
+      <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+      <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Créer"}/>
+    </SidePanel>;
+  }
+
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+      <span style={{fontSize:15,fontWeight:500}}>Projets ({sheet.rows.length})</span>
+      <Btn primary onClick={()=>{setNotesProjet(null);setEditing(null);setForm(EP);setErr("");setOpen(true);}}>+ Nouveau projet</Btn>
+    </div>
+    {sheet.loading&&<div style={{fontSize:13,color:"var(--text-secondary)",padding:12}}>Chargement...</div>}
+    {!sheet.rows.length&&!sheet.loading&&<Bd style={{textAlign:"center",padding:24,color:"var(--text-secondary)",fontSize:13}}>Aucun projet.</Bd>}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+      {sheet.rows.map(p=>{
+        const c=sc(p.statut);const bp=p.budget>0?Math.round(p.depense/p.budget*100):0;
+        const nbNotes=notes.rows.filter(n=>Number(n.projet_id)===Number(p.id)).length;
+        return(
+          <Bd key={p.id}>
+            <div style={{display:"flex",justifyContent:"space-between",marginBottom:6}}>
+              <div><div style={{fontSize:14,fontWeight:500}}>{p.name}</div>{p.client&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>{p.client}</div>}{p.lieu&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>📍 {p.lieu}</div>}</div>
+              <div style={{display:"flex",gap:4,alignItems:"flex-start"}}>
+                <button onClick={()=>{setOpen(false);setNotesProjet(p);}} style={{background:"none",border:"1px solid var(--border)",borderRadius:6,cursor:"pointer",fontSize:12,padding:"2px 7px",color:"var(--text-secondary)",display:"flex",alignItems:"center",gap:4}}>
+                  📝{nbNotes>0&&<span style={{background:"#1D9E75",color:"#fff",borderRadius:10,fontSize:10,padding:"0 5px"}}>{nbNotes}</span>}
+                </button>
+                <button onClick={()=>{setNotesProjet(null);setEditing(p.id);setForm({...p});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>✏️</button>
+                <button onClick={()=>{if(confirm("Supprimer ce projet ?"))sheet.remove(p.id);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:13}}>🗑</button>
+              </div>
+            </div>
+            <Badge label={p.statut} bg={c.bg} color={c.tx}/>
+            <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>Avancement : {p.avancement}%</div><PBar val={p.avancement}/>
+            {p.budget>0&&<><div style={{fontSize:12,color:"var(--text-secondary)",marginTop:6}}>{Number(p.depense).toLocaleString("fr-FR")}€ / {Number(p.budget).toLocaleString("fr-FR")}€</div><PBar val={bp}/></>}
+          </Bd>
+        );
+      })}
+    </div>
+  </WithPanel>;
+}
+
+// ══ TÂCHES ══
+const ET={text:"",urgence:"med",projet:"",due:""};
+function Taches({sheet,projects}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(ET);
+  const [editing,setEditing]=useState(null);
+  const [filter,setFilter]=useState("pending");
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  const isDone=t=>t.done===true||t.done==="TRUE";
+  async function save(){
+    if(!form.text.trim()){setErr("Description obligatoire.");return;}
+    setSaving(true);setErr("");
+    try{const item={...form,done:editing?isDone(sheet.rows.find(t=>Number(t.id)===Number(editing))||{}):false};
+      if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}
+    catch(e){setErr(e.message);}setSaving(false);
+  }
+  async function toggle(t){await sheet.update(t.id,{...t,done:!isDone(t)});}
+  const uc={high:{bg:"#FCEBEB",tx:"#A32D2D",lbl:"Urgent"},med:{bg:"#FAEEDA",tx:"#854F0B",lbl:"Normal"},low:{bg:"#E1F5EE",tx:"#0F6E56",lbl:"Faible"}};
+  const filtered=sheet.rows.filter(t=>filter==="all"||(filter==="pending"&&!isDone(t))||(filter==="done"&&isDone(t)));
+  const panel=open&&<SidePanel title={editing?"Modifier tâche":"Nouvelle tâche"} onClose={()=>setOpen(false)}>
+    <FG label="Description *"><Inp value={form.text} onChange={e=>f("text",e.target.value)} placeholder="Ex: Relance fournisseur"/></FG>
+    <FG label="Urgence"><Sel value={form.urgence} onChange={e=>f("urgence",e.target.value)}><option value="high">Urgent</option><option value="med">Normal</option><option value="low">Faible</option></Sel></FG>
+    <FG label="Échéance"><Inp type="date" value={form.due} onChange={e=>f("due",e.target.value)}/></FG>
+    <FG label="Projet"><Sel value={form.projet} onChange={e=>f("projet",e.target.value)}><option value="">— Aucun —</option>{projects.rows.map(p=><option key={p.id}>{p.name}</option>)}</Sel></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Ajouter"}/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+      <div style={{display:"flex",gap:6}}>
+        {[["pending","En cours"],["done","Terminées"],["all","Toutes"]].map(([v,l])=>(
+          <button key={v} onClick={()=>setFilter(v)} style={{padding:"5px 11px",borderRadius:7,fontSize:12,cursor:"pointer",border:"1px solid var(--border)",background:filter===v?"var(--bg-secondary)":"#fff",color:"var(--text-primary)"}}>{l}</button>
+        ))}
+      </div>
+      <Btn primary onClick={()=>{setEditing(null);setForm(ET);setErr("");setOpen(true);}}>+ Nouvelle tâche</Btn>
+    </div>
+    <Bd>
+      {!filtered.length&&<div style={{fontSize:13,color:"var(--text-secondary)",padding:"10px 0"}}>Aucune tâche.</div>}
+      {filtered.map(t=>{const u=uc[t.urgence]||uc.med;const done=isDone(t);return(
+        <div key={t.id} style={{display:"flex",alignItems:"flex-start",gap:8,padding:"9px 0",borderBottom:"1px solid var(--border-light)"}}>
+          <Check checked={done} onChange={()=>toggle(t)} color="#1D9E75"/>
+          <div style={{flex:1}}><div style={{fontSize:13,textDecoration:done?"line-through":"none",color:done?"var(--text-secondary)":"var(--text-primary)"}}>{t.text}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{t.projet} {t.due&&`· ${fmt(t.due)}`}</div></div>
+          <Badge label={u.lbl} bg={u.bg} color={u.tx}/>
+          <button onClick={()=>{setEditing(t.id);setForm({...t});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>✏️</button>
+          <button onClick={()=>sheet.remove(t.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>🗑</button>
+        </div>
+      );})}
+    </Bd>
+  </WithPanel>;
+}
+
+// ══ CALENDRIER ══
+function Calendrier({sheet,projects}){
+  const [year,setYear]=useState(()=>new Date().getFullYear());
+  const [month,setMonth]=useState(()=>new Date().getMonth());
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState({title:"",date:"",type:"rdv",projet:"",note:""});
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  const prevM=()=>{if(month===0){setMonth(11);setYear(y=>y-1);}else setMonth(m=>m-1);};
+  const nextM=()=>{if(month===11){setMonth(0);setYear(y=>y+1);}else setMonth(m=>m+1);};
+  const firstDow=(()=>{let d=new Date(year,month,1).getDay();return d===0?6:d-1;})();
+  const dim=new Date(year,month+1,0).getDate();
+  const prevDim=new Date(year,month,0).getDate();
+  function ds(d){return year+"-"+String(month+1).padStart(2,"0")+"-"+String(d).padStart(2,"0");}
+  async function save(){if(!form.title||!form.date)return;setSaving(true);try{if(editing){await sheet.update(editing,form);}else{await sheet.add(form);}setOpen(false);}catch(e){}setSaving(false);}
+  const cells=[];
+  for(let i=firstDow-1;i>=0;i--)cells.push({day:prevDim-i,cur:false});
+  for(let d=1;d<=dim;d++)cells.push({day:d,cur:true});
+  while(cells.length%7!==0)cells.push({day:cells.length-firstDow-dim+1,cur:false});
+  const mevs=sheet.rows.filter(e=>{const[y,m]=e.date.split("-");return+y===year&&+m-1===month;}).sort((a,b)=>a.date.localeCompare(b.date));
+  const panel=open&&<SidePanel title={editing?"Modifier":"Nouvel événement"} onClose={()=>setOpen(false)}>
+    <FG label="Titre *"><Inp value={form.title} onChange={e=>f("title",e.target.value)} placeholder="Ex: RDV MOA"/></FG>
+    <FG label="Date *"><Inp type="date" value={form.date} onChange={e=>f("date",e.target.value)}/></FG>
+    <FG label="Type"><Sel value={form.type} onChange={e=>f("type",e.target.value)}><option value="rdv">Rendez-vous</option><option value="deadline">Deadline</option><option value="chantier">Démarrage chantier</option><option value="livraison">Livraison</option><option value="reunion">Réunion</option></Sel></FG>
+    <FG label="Projet"><Sel value={form.projet} onChange={e=>f("projet",e.target.value)}><option value="">— Aucun —</option>{projects.rows.map(p=><option key={p.id}>{p.name}</option>)}</Sel></FG>
+    <FG label="Note"><Inp value={form.note} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+    <PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Enregistrer"}/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <Bd style={{marginBottom:12}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between",marginBottom:10}}>
+        <button onClick={prevM} style={{background:"none",border:"none",cursor:"pointer",fontSize:18,padding:"0 8px",color:"var(--text-secondary)"}}>‹</button>
+        <span style={{fontSize:14,fontWeight:500}}>{MONTHS[month]} {year}</span>
+        <button onClick={nextM} style={{background:"none",border:"none",cursor:"pointer",fontSize:18,padding:"0 8px",color:"var(--text-secondary)"}}>›</button>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(7,1fr)",gap:2}}>
+        {["L","M","M","J","V","S","D"].map((d,i)=><div key={i} style={{textAlign:"center",fontSize:11,color:"var(--text-secondary)",padding:"3px 0"}}>{d}</div>)}
+        {cells.map((c,i)=>{
+          const dStr=c.cur?ds(c.day):null;
+          const evs=dStr?sheet.rows.filter(e=>e.date===dStr):[];
+          const hasR=evs.some(e=>e.type!=="deadline"),hasDl=evs.some(e=>e.type==="deadline"),isT=dStr===TODAY;
+          return(<div key={i} style={{minHeight:32,borderRadius:6,padding:"3px 4px",fontSize:12,color:c.cur?"var(--text-primary)":"var(--text-tertiary)",background:isT?"#E1F5EE":"transparent",border:isT?"1px solid #1D9E75":"1px solid transparent",position:"relative"}}>
+            <span style={{fontWeight:isT?600:400,color:isT?"#0F6E56":undefined}}>{c.day}</span>
+            {(hasR||hasDl)&&<div style={{width:4,height:4,borderRadius:"50%",background:hasDl&&hasR?"#EF9F27":hasDl?"#E24B4A":"#1D9E75",position:"absolute",bottom:3,right:3}}/>}
+          </div>);
+        })}
+      </div>
+    </Bd>
+    <Bd>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:13,fontWeight:500}}>{MONTHS[month]} — {mevs.length} événement{mevs.length!==1?"s":""}</span>
+        <Btn primary onClick={()=>{setEditing(null);setForm({title:"",date:"",type:"rdv",projet:"",note:""});setOpen(true);}}>+ Ajouter</Btn>
+      </div>
+      {mevs.map(ev=>(
+        <div key={ev.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 8px",borderRadius:7,background:"var(--bg-secondary)",marginBottom:5}}>
+          <div style={{width:7,height:7,borderRadius:"50%",background:EV_COLORS[ev.type]||"#888",flexShrink:0}}/>
+          <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{ev.title}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{fmt(ev.date)} · <Badge label={EV_LABELS[ev.type]||ev.type} bg="#F1EFE8" color="#5F5E5A"/></div></div>
+          <button onClick={()=>{setEditing(ev.id);setForm({...ev});setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>✏️</button>
+          <button onClick={()=>sheet.remove(ev.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:13,color:"var(--text-tertiary)"}}>✕</button>
+        </div>
+      ))}
+    </Bd>
+  </WithPanel>;
+}
+
+// ══ ÉQUIPE ══
+const EM={nom:"",role:"",statut:"chantier",loc:"",tel:"",email:"",note:""};
+const AVATARS_BG=["#9FE1CB:#085041","#B5D4F4:#0C447C","#FAC775:#633806","#CECBF6:#3C3489","#F4B8B8:#7A1C1C","#B8E0F4:#1C4A7A"];
+function initials(n){return n.split(" ").map(x=>x[0]||"").join("").slice(0,2).toUpperCase();}
+function Equipes({sheet,journal}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EM);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const [jtext,setJtext]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  async function save(){if(!form.nom.trim()){setErr("Nom obligatoire.");return;}setSaving(true);setErr("");try{if(editing){await sheet.update(editing,form);}else{await sheet.add(form);}setOpen(false);}catch(e){setErr(e.message);}setSaving(false);}
+  async function saveJ(){if(!jtext.trim())return;await journal.add({date:TODAY,texte:jtext});setJtext("");}
+  const sb=(s)=>({chantier:{bg:"#FAEEDA",tx:"#854F0B"},atelier:{bg:"#E6F1FB",tx:"#185FA5"},bureau:{bg:"#F1EFE8",tx:"#5F5E5A"},congé:{bg:"#FCEBEB",tx:"#A32D2D"},déplacement:{bg:"#E1F5EE",tx:"#0F6E56"}}[s]||{bg:"#F1EFE8",tx:"#5F5E5A"});
+  const panel=open&&<SidePanel title={editing?"Modifier membre":"Nouveau membre"} onClose={()=>setOpen(false)}>
+    <FG label="Nom *"><Inp value={form.nom} onChange={e=>f("nom",e.target.value)} placeholder="Ex: Marc Dupont"/></FG>
+    <FG label="Rôle"><Inp value={form.role} onChange={e=>f("role",e.target.value)} placeholder="Ex: Chef d'équipe"/></FG>
+    <FG label="Statut"><Sel value={form.statut} onChange={e=>f("statut",e.target.value)}>{STATUTS_TEAM.map(s=><option key={s}>{s}</option>)}</Sel></FG>
+    <FG label="Localisation"><Inp value={form.loc} onChange={e=>f("loc",e.target.value)} placeholder="Ex: Chantier Bordeaux"/></FG>
+    <FG label="Téléphone"><Inp value={form.tel||""} onChange={e=>f("tel",e.target.value)} placeholder="06 12 34 56 78"/></FG>
+    <FG label="Email"><Inp value={form.email||""} onChange={e=>f("email",e.target.value)} placeholder="m.dupont@..."/></FG>
+    <FG label="Note"><Inp value={form.note||""} onChange={e=>f("note",e.target.value)} placeholder="Optionnel"/></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Ajouter"}/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+      <span style={{fontSize:15,fontWeight:500}}>Équipe ({sheet.rows.length})</span>
+      <Btn primary onClick={()=>{setEditing(null);setForm(EM);setErr("");setOpen(true);}}>+ Ajouter</Btn>
+    </div>
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+      {sheet.rows.map((m,i)=>{const [bg,tx]=AVATARS_BG[i%6].split(":");const s=sb(m.statut);return(
+        <Bd key={m.id} style={{padding:10}}>
+          <div style={{display:"flex",gap:8}}>
+            <div style={{width:34,height:34,borderRadius:"50%",background:bg,color:tx,display:"flex",alignItems:"center",justifyContent:"center",fontSize:12,fontWeight:600,flexShrink:0}}>{initials(m.nom)}</div>
+            <div style={{flex:1,minWidth:0}}>
+              <div style={{display:"flex",justifyContent:"space-between"}}>
+                <div style={{fontSize:13,fontWeight:500,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{m.nom}</div>
+                <div style={{display:"flex",gap:3}}><button onClick={()=>{setEditing(m.id);setForm({...m});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>✏️</button><button onClick={()=>sheet.remove(m.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>🗑</button></div>
+              </div>
+              <div style={{fontSize:12,color:"var(--text-secondary)"}}>{m.role}</div>
+              <div style={{marginTop:4,display:"flex",gap:6,flexWrap:"wrap"}}><Badge label={m.statut} bg={s.bg} color={s.tx}/>{m.loc&&<span style={{fontSize:11,color:"var(--text-secondary)"}}>📍{m.loc}</span>}</div>
+              {m.tel&&<div style={{fontSize:11,color:"var(--text-secondary)",marginTop:2}}>📞{m.tel}</div>}
+            </div>
+          </div>
+        </Bd>
+      );})}
+    </div>
+    <Bd>
+      <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>📝 Journal de chantier</div>
+      <Inp value={jtext} onChange={e=>setJtext(e.target.value)} rows={3} placeholder={"CR du "+fmt(TODAY)+"..."}/>
+      <div style={{display:"flex",justifyContent:"flex-end",marginTop:8}}><Btn primary onClick={saveJ}>💾 Enregistrer</Btn></div>
+      {journal.rows.slice(0,5).map(j=>(
+        <div key={j.id} style={{marginTop:8,padding:"8px 10px",background:"var(--bg-secondary)",borderRadius:7,display:"flex",gap:8}}>
+          <div style={{flex:1}}><div style={{fontSize:11,color:"var(--text-secondary)",marginBottom:2}}>{fmt(j.date)}</div><div style={{fontSize:13}}>{j.texte}</div></div>
+          <button onClick={()=>journal.remove(j.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12,color:"var(--text-tertiary)",alignSelf:"flex-start"}}>🗑</button>
+        </div>
+      ))}
+    </Bd>
+  </WithPanel>;
+}
+
+// ══ FOURNISSEURS ══
+const EF={nom:"",specialite:"",note:3,contact:"",delai:"",tel:"",adresse:""};
+function Fournisseurs({sheet}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EF);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  async function save(){if(!form.nom.trim()){setErr("Nom obligatoire.");return;}setSaving(true);setErr("");try{const item={...form,note:+form.note||3};if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}catch(e){setErr(e.message);}setSaving(false);}
+  const panel=open&&<SidePanel title={editing?"Modifier":"Nouveau fournisseur"} onClose={()=>setOpen(false)}>
+    <FG label="Nom *"><Inp value={form.nom} onChange={e=>f("nom",e.target.value)} placeholder="Ex: Nowofol GmbH"/></FG>
+    <FG label="Spécialité"><Inp value={form.specialite} onChange={e=>f("specialite",e.target.value)} placeholder="Ex: Films ETFE"/></FG>
+    <FG label="Délai livraison"><Inp value={form.delai} onChange={e=>f("delai",e.target.value)} placeholder="Ex: 3-5 jours"/></FG>
+    <FG label="Email / contact"><Inp value={form.contact} onChange={e=>f("contact",e.target.value)} placeholder="info@..."/></FG>
+    <FG label="Téléphone"><Inp value={form.tel||""} onChange={e=>f("tel",e.target.value)}/></FG>
+    <FG label="Adresse"><Inp value={form.adresse||""} onChange={e=>f("adresse",e.target.value)} placeholder="Optionnel"/></FG>
+    <FG label={`Note : ${"★".repeat(+form.note||0)+"☆".repeat(5-(+form.note||0))}`}><input type="range" min="1" max="5" value={form.note} onChange={e=>f("note",e.target.value)} style={{width:"100%"}}/></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Ajouter"}/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+      <span style={{fontSize:15,fontWeight:500}}>Fournisseurs ({sheet.rows.length})</span>
+      <Btn primary onClick={()=>{setEditing(null);setForm(EF);setErr("");setOpen(true);}}>+ Ajouter</Btn>
+    </div>
+    {!sheet.rows.length&&<Bd style={{textAlign:"center",padding:24,color:"var(--text-secondary)",fontSize:13}}>Aucun fournisseur.</Bd>}
+    <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10}}>
+      {sheet.rows.map(x=>(
+        <Bd key={x.id} style={{padding:12}}>
+          <div style={{display:"flex",justifyContent:"space-between"}}>
+            <div style={{flex:1}}>
+              <div style={{fontSize:13,fontWeight:500}}>{x.nom}</div>
+              {x.specialite&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>{x.specialite}</div>}
+              <div style={{fontSize:12,color:"#EF9F27",marginTop:3}}>{"★".repeat(x.note)+"☆".repeat(5-x.note)}</div>
+              {x.delai&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>⏱ {x.delai}</div>}
+              {x.contact&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>{x.contact}</div>}
+              {x.tel&&<div style={{fontSize:12,color:"var(--text-secondary)"}}>📞{x.tel}</div>}
+            </div>
+            <div style={{display:"flex",gap:3}}><button onClick={()=>{setEditing(x.id);setForm({...x});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>✏️</button><button onClick={()=>sheet.remove(x.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>🗑</button></div>
+          </div>
+        </Bd>
+      ))}
+    </div>
+  </WithPanel>;
+}
+
+// ══ STOCKS ══
+const ES={ref:"",cat:"",fourn:"",qty:"",min:"",unit:"pcs",prix:"",loc:"",note:""};
+function Stocks({sheet,fournisseurs}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(ES);
+  const [editing,setEditing]=useState(null);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  async function save(){if(!form.ref.trim()){setErr("Désignation obligatoire.");return;}if(form.qty===""||form.min===""){setErr("Quantité et seuil obligatoires.");return;}setSaving(true);setErr("");try{const item={...form,qty:+form.qty||0,min:+form.min||0,prix:+form.prix||0};if(editing){await sheet.update(editing,item);}else{await sheet.add(item);}setOpen(false);}catch(e){setErr(e.message);}setSaving(false);}
+  const alerts=sheet.rows.filter(s=>Number(s.qty)<Number(s.min));
+  const valeur=sheet.rows.reduce((s,i)=>s+Number(i.qty)*(Number(i.prix)||0),0);
+  const panel=open&&<SidePanel title={editing?"Modifier article":"Nouvel article"} onClose={()=>setOpen(false)}>
+    <FG label="Désignation *"><Inp value={form.ref} onChange={e=>f("ref",e.target.value)} placeholder="Ex: Visserie ETFE M12"/></FG>
+    <FG label="Catégorie"><Sel value={form.cat} onChange={e=>f("cat",e.target.value)}><option value="">— Choisir —</option>{CATS.map(c=><option key={c}>{c}</option>)}</Sel></FG>
+    <FG label="Fournisseur"><Sel value={form.fourn} onChange={e=>f("fourn",e.target.value)}><option value="">— Choisir —</option>{fournisseurs.rows.map(x=><option key={x.id}>{x.nom}</option>)}<option>Autre</option></Sel></FG>
+    <FG label="Quantité *"><Inp type="number" value={form.qty} onChange={e=>f("qty",e.target.value)} placeholder="0"/></FG>
+    <FG label="Seuil d'alerte *"><Inp type="number" value={form.min} onChange={e=>f("min",e.target.value)} placeholder="0"/></FG>
+    <FG label="Unité"><Sel value={form.unit} onChange={e=>f("unit",e.target.value)}>{UNITS.map(u=><option key={u}>{u}</option>)}</Sel></FG>
+    <FG label="Prix unitaire (€)"><Inp type="number" value={form.prix} onChange={e=>f("prix",e.target.value)} placeholder="0.00"/></FG>
+    <FG label="Emplacement"><Inp value={form.loc} onChange={e=>f("loc",e.target.value)} placeholder="Ex: Étagère A3"/></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel={editing?"Mettre à jour":"Enregistrer"}/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
+      {[{val:sheet.rows.length,lbl:"Références"},{val:alerts.length,lbl:"Sous seuil",red:alerts.length>0},{val:valeur.toLocaleString("fr-FR")+"€",lbl:"Valeur totale"}].map((m,i)=>(
+        <div key={i} style={{background:"var(--bg-secondary)",borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+          <div style={{fontSize:18,fontWeight:500,color:m.red?"#A32D2D":"var(--text-primary)"}}>{m.val}</div>
+          <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:2}}>{m.lbl}</div>
+        </div>
+      ))}
+    </div>
+    {alerts.length>0&&<div style={{background:"#FCEBEB",border:"1px solid #F09595",borderRadius:8,padding:"8px 12px",marginBottom:10,fontSize:13,color:"#A32D2D"}}>⚠️ {alerts.map(s=>s.ref).join(", ")}</div>}
+    <Bd>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:14,fontWeight:500}}>Inventaire</span>
+        <Btn primary onClick={()=>{setEditing(null);setForm(ES);setErr("");setOpen(true);}}>+ Nouvel article</Btn>
+      </div>
+      {!sheet.rows.length&&<div style={{fontSize:13,color:"var(--text-secondary)",padding:"10px 0"}}>Aucun article.</div>}
+      {sheet.rows.map(s=>{const r=Number(s.qty)/Math.max(Number(s.min),0.001);const sb=r<0.7?{bg:"#FCEBEB",tx:"#A32D2D",lbl:"Critique"}:r<1?{bg:"#FAEEDA",tx:"#854F0B",lbl:"Bas"}:{bg:"#EAF3DE",tx:"#3B6D11",lbl:"OK"};return(
+        <div key={s.id} style={{display:"flex",alignItems:"center",gap:8,padding:"8px 0",borderBottom:"1px solid var(--border-light)"}}>
+          <div style={{flex:1}}><div style={{fontSize:13,fontWeight:500}}>{s.ref}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{[s.cat,s.loc].filter(Boolean).join(" · ")}</div></div>
+          <span style={{fontSize:12,color:"var(--text-secondary)",whiteSpace:"nowrap"}}>{s.qty}/{s.min} {s.unit}</span>
+          <Badge label={sb.lbl} bg={sb.bg} color={sb.tx}/>
+          <button onClick={()=>{setEditing(s.id);setForm({...s,qty:String(s.qty),min:String(s.min),prix:String(s.prix)});setErr("");setOpen(true);}} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>✏️</button>
+          <button onClick={()=>sheet.remove(s.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:12}}>🗑</button>
+        </div>
+      );})}
+    </Bd>
+  </WithPanel>;
+}
+
+// ══ COMMANDES ══
+const EO={ref:"",fourn:"",article:"",qty:"",unit:"pcs",prix:"",cat:"",loc:"",date:TODAY};
+function Commandes({sheet,stocks,fournisseurs}){
+  const [open,setOpen]=useState(false);
+  const [form,setForm]=useState(EO);
+  const [saving,setSaving]=useState(false);
+  const [err,setErr]=useState("");
+  const f=(k,v)=>setForm(x=>({...x,[k]:v}));
+  const isBool=v=>v===true||v==="TRUE";
+  async function toggle(o,field){
+    const next={...o,[field]:!isBool(o[field])};
+    if(field==="recue"&&next.recue){next.passee=true;await addToStock(next);}
+    if(field==="factureCompta"&&next.factureCompta)next.passee=true;
+    await sheet.update(o.id,next);
+  }
+  async function addToStock(ord){
+    const idx=stocks.rows.findIndex(s=>s.ref.toLowerCase()===ord.article.toLowerCase());
+    if(idx>=0){const s=stocks.rows[idx];await stocks.update(s.id,{...s,qty:Number(s.qty)+(+ord.qty||0)});}
+    else{await stocks.add({ref:ord.article,cat:ord.cat||"",qty:+ord.qty||0,min:0,unit:ord.unit||"pcs",prix:+ord.prix||0,loc:ord.loc||"",fourn:ord.fourn||""});}
+  }
+  async function save(){if(!form.article.trim()){setErr("Article obligatoire.");return;}if(!form.fourn.trim()){setErr("Fournisseur obligatoire.");return;}setSaving(true);setErr("");try{await sheet.add({...form,qty:+form.qty||0,prix:+form.prix||0,passee:false,recue:false,factureCompta:false});setOpen(false);setForm(EO);}catch(e){setErr(e.message);}setSaving(false);}
+  const encours=sheet.rows.filter(o=>!isBool(o.recue));
+  const recues=sheet.rows.filter(o=>isBool(o.recue));
+  const alerteCompta=recues.filter(o=>!isBool(o.factureCompta));
+  const panel=open&&<SidePanel title="Nouvelle commande" onClose={()=>setOpen(false)}>
+    <FG label="Référence"><Inp value={form.ref} onChange={e=>f("ref",e.target.value)} placeholder="CMD-001"/></FG>
+    <FG label="Date"><Inp type="date" value={form.date} onChange={e=>f("date",e.target.value)}/></FG>
+    <FG label="Article *"><Inp value={form.article} onChange={e=>f("article",e.target.value)} placeholder="Ex: Profilés keder 2m"/></FG>
+    <FG label="Fournisseur *"><Sel value={form.fourn} onChange={e=>f("fourn",e.target.value)}><option value="">— Choisir —</option>{fournisseurs.rows.map(x=><option key={x.id}>{x.nom}</option>)}<option value="Autre">Autre</option></Sel></FG>
+    <FG label="Quantité"><Inp type="number" value={form.qty} onChange={e=>f("qty",e.target.value)} placeholder="0"/></FG>
+    <FG label="Unité"><Sel value={form.unit} onChange={e=>f("unit",e.target.value)}>{UNITS.map(u=><option key={u}>{u}</option>)}</Sel></FG>
+    <FG label="Prix unitaire (€)"><Inp type="number" value={form.prix} onChange={e=>f("prix",e.target.value)} placeholder="0.00"/></FG>
+    <FG label="Catégorie stock"><Sel value={form.cat} onChange={e=>f("cat",e.target.value)}><option value="">— Choisir —</option>{CATS.map(c=><option key={c}>{c}</option>)}</Sel></FG>
+    <FG label="Emplacement"><Inp value={form.loc} onChange={e=>f("loc",e.target.value)} placeholder="Ex: Rack B2"/></FG>
+    <ErrMsg msg={err}/><PanelBtns onCancel={()=>setOpen(false)} onSave={save} saving={saving} saveLabel="Créer"/>
+  </SidePanel>;
+  return <WithPanel panel={panel}>
+    <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:10,marginBottom:12}}>
+      {[{val:encours.length,lbl:"En cours"},{val:recues.length,lbl:"Reçues"},{val:alerteCompta.length,lbl:"Factures en attente",red:alerteCompta.length>0}].map((m,i)=>(
+        <div key={i} style={{background:"var(--bg-secondary)",borderRadius:8,padding:"10px 12px",textAlign:"center"}}>
+          <div style={{fontSize:18,fontWeight:500,color:m.red?"#A32D2D":"var(--text-primary)"}}>{m.val}</div>
+          <div style={{fontSize:12,color:"var(--text-secondary)",marginTop:2}}>{m.lbl}</div>
+        </div>
+      ))}
+    </div>
+    {alerteCompta.length>0&&<div style={{background:"#FAEEDA",border:"1px solid #EF9F27",borderRadius:8,padding:"8px 12px",marginBottom:10,fontSize:13,color:"#854F0B"}}>🔔 {alerteCompta.length} facture(s) non transmise(s)</div>}
+    <Bd style={{marginBottom:12}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:10}}>
+        <span style={{fontSize:14,fontWeight:500}}>En cours</span>
+        <Btn primary onClick={()=>{setErr("");setForm(EO);setOpen(true);}}>+ Nouvelle commande</Btn>
+      </div>
+      {!encours.length&&<div style={{fontSize:13,color:"var(--text-secondary)"}}>Aucune commande en cours.</div>}
+      {encours.map(o=>(
+        <div key={o.id} style={{padding:"10px 0",borderBottom:"1px solid var(--border-light)"}}>
+          <div style={{display:"flex",justifyContent:"space-between",marginBottom:4}}>
+            <div><span style={{fontSize:13,fontWeight:500}}>{o.article}</span>{o.ref&&<span style={{fontSize:11,color:"var(--text-secondary)",marginLeft:6}}>{o.ref}</span>}</div>
+            <button onClick={()=>sheet.remove(o.id)} style={{background:"none",border:"none",cursor:"pointer",fontSize:13,color:"var(--text-tertiary)"}}>✕</button>
+          </div>
+          <div style={{fontSize:12,color:"var(--text-secondary)",marginBottom:6}}>{o.fourn} · {o.qty} {o.unit} · {fmt(o.date)}</div>
+          <div style={{display:"flex",gap:16}}>
+            <Check checked={isBool(o.passee)} onChange={()=>toggle(o,"passee")} label="Passée" color="#378ADD"/>
+            <Check checked={isBool(o.recue)} onChange={()=>toggle(o,"recue")} label="Reçue" color="#1D9E75"/>
+            <Check checked={isBool(o.factureCompta)} onChange={()=>toggle(o,"factureCompta")} label="→ Compta" color="#7F77DD"/>
+          </div>
+        </div>
+      ))}
+    </Bd>
+    {recues.length>0&&<Bd>
+      <div style={{fontSize:13,fontWeight:500,color:"var(--text-secondary)",marginBottom:8}}>🗃️ Historique ({recues.length})</div>
+      {recues.map(o=>(
+        <div key={o.id} style={{display:"flex",alignItems:"center",gap:8,padding:"7px 0",borderBottom:"1px solid var(--border-light)"}}>
+          <div style={{flex:1}}><div style={{fontSize:13,color:"var(--text-secondary)",textDecoration:"line-through"}}>{o.article}</div><div style={{fontSize:11,color:"var(--text-secondary)"}}>{o.fourn} · {fmt(o.date)}</div></div>
+          <Badge label="Reçue ✓" bg="#E1F5EE" color="#0F6E56"/>
+          {isBool(o.factureCompta)?<Badge label="Compta ✓" bg="#E1F5EE" color="#0F6E56"/>:<Badge label="Facture ?" bg="#FAEEDA" color="#854F0B"/>}
+        </div>
+      ))}
+    </Bd>}
+  </WithPanel>;
+}
+
+// ══ APP ROOT ══
+const PANELS=[
+  {id:"dashboard",label:"Tableau de bord",icon:"🏠"},
+  {id:"projets",label:"Projets",icon:"🏗️"},
+  {id:"taches",label:"Tâches",icon:"✅"},
+  {id:"calendrier",label:"Calendrier",icon:"📅"},
+  {id:"equipes",label:"Équipe",icon:"👷"},
+  {id:"fournisseurs",label:"Fournisseurs",icon:"🏭"},
+  {id:"stocks",label:"Stocks",icon:"📦"},
+  {id:"commandes",label:"Commandes",icon:"🚚"},
+];
+
+function App(){
+  const [panel,setPanel]=useState("dashboard");
+  const [initializing,setInitializing]=useState(true);
+  const [initErr,setInitErr]=useState(null);
+
+  const projects     = useSheet("projects");
+  const tasks        = useSheet("tasks");
+  const events       = useSheet("events");
+  const team         = useSheet("team");
+  const journal      = useSheet("journal");
+  const fournisseurs = useSheet("fournisseurs");
+  const stocks       = useSheet("stocks");
+  const notes       = useSheet("notes");
+  const sheets={projects,tasks,events,team,journal,fournisseurs,stocks,orders,notes};
+
+  useEffect(()=>{
+    gasInit().then(()=>setInitializing(false)).catch(e=>{setInitErr(e.message);setInitializing(false);});
+  },[]);
+
+  const alerts=[...projects.rows.filter(p=>p.statut==="retard"),...stocks.rows.filter(s=>Number(s.qty)<Number(s.min)),...orders.rows.filter(o=>(o.recue===true||o.recue==="TRUE")&&!o.factureCompta&&o.factureCompta!=="TRUE")];
+
+  if(initializing)return(
+    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",gap:12,background:"var(--bg-secondary)"}}>
+      <div style={{fontSize:32}}>🏗️</div>
+      <div style={{fontSize:14,color:"var(--text-secondary)"}}>Connexion à Google Sheets...</div>
+    </div>
+  );
+
+  if(initErr)return(
+    <div style={{padding:24,maxWidth:500,margin:"60px auto"}}>
+      <div style={{background:"#FCEBEB",border:"1px solid #F09595",borderRadius:10,padding:16,fontSize:13,color:"#A32D2D"}}>
+        <div style={{fontWeight:500,marginBottom:6}}>❌ Erreur de connexion</div>
+        <div style={{marginBottom:10}}>{initErr}</div>
+        <button onClick={()=>window.location.reload()} style={{padding:"6px 14px",borderRadius:7,border:"1px solid #E24B4A",background:"#fff",color:"#A32D2D",cursor:"pointer",fontSize:13}}>🔄 Réessayer</button>
+      </div>
+    </div>
+  );
+
+  return(
+    <div style={{display:"flex",flexDirection:"column",minHeight:"100vh"}}>
+      <div style={{display:"flex",alignItems:"center",padding:"8px 16px",borderBottom:"1px solid var(--border)",background:"#fff",flexWrap:"wrap",gap:4,position:"sticky",top:0,zIndex:10}}>
+        <div style={{fontSize:14,fontWeight:600,marginRight:8,display:"flex",alignItems:"center",gap:6}}>
+          🏗️ BTP Manager
+          <span style={{fontSize:10,color:"#1D9E75",border:"1px solid #1D9E75",borderRadius:4,padding:"1px 5px"}}>Google Sheets ✓</span>
+          <span style={{fontSize:10,color:"#666",border:"1px solid #ccc",borderRadius:4,padding:"1px 5px"}}>{VERSION}</span>
+          {alerts.length>0&&<span style={{background:"#E24B4A",color:"#fff",fontSize:11,padding:"1px 6px",borderRadius:20}}>{alerts.length}</span>}
+        </div>
+        {PANELS.map(p=>(
+          <button key={p.id} onClick={()=>setPanel(p.id)} style={{background:panel===p.id?"var(--bg-secondary)":"none",border:"none",cursor:"pointer",padding:"5px 10px",borderRadius:7,fontSize:12,fontWeight:panel===p.id?600:400,color:panel===p.id?"var(--text-primary)":"var(--text-secondary)",display:"flex",alignItems:"center",gap:4}}>
+            {p.icon} {p.label}
+          </button>
+        ))}
+      </div>
+      <div style={{flex:1,padding:16,background:"var(--bg-tertiary)"}}>
+        {panel==="dashboard"   &&<Dashboard sheets={sheets}/>}
+        {panel==="projets"     &&<Projets sheet={projects} notes={notes}/>}
+        {panel==="taches"      &&<Taches sheet={tasks} projects={projects}/>}
+        {panel==="calendrier"  &&<Calendrier sheet={events} projects={projects}/>}
+        {panel==="equipes"     &&<Equipes sheet={team} journal={journal}/>}
+        {panel==="fournisseurs"&&<Fournisseurs sheet={fournisseurs}/>}
+        {panel==="stocks"      &&<Stocks sheet={stocks} fournisseurs={fournisseurs}/>}
+        {panel==="commandes"   &&<Commandes sheet={orders} stocks={stocks} fournisseurs={fournisseurs}/>}
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
 </script>
 </body>
 </html>
